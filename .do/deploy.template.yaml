@@ -15,10 +15,31 @@ spec:
       value: EV[GITHUB_REPO]
     - key: NAME
       scope: RUN_TIME
-      value: do-actions-runner
+      value: runner-small
     git:
       branch: main
       repo_clone_url: https://github.com/rub-a-dub-dub/do-actions-runner.git
     instance_count: 2
-    instance_size_slug: basic-m
-    name: do-actions-runner
+    instance_size_slug: apps-s-1vcpu-2gb
+    name: runner-small
+  - dockerfile_path: Dockerfile
+    envs:
+    - key: TOKEN
+      scope: RUN_TIME
+      type: SECRET
+      value: EV[GITHUB_PAT]
+    - key: OWNER
+      scope: RUN_TIME
+      value: EV[GITHUB_OWNER]
+    - key: REPO
+      scope: RUN_TIME
+      value: EV[GITHUB_REPO]
+    - key: NAME
+      scope: RUN_TIME
+      value: runner-large
+    git:
+      branch: main
+      repo_clone_url: https://github.com/rub-a-dub-dub/do-actions-runner.git
+    instance_count: 1
+    instance_size_slug: apps-s-2vcpu-4gb
+    name: runner-large
