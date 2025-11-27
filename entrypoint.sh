@@ -29,7 +29,7 @@ cleanup() {
 ./config.sh \
   --url "https://github.com/${CONFIG_PATH}" \
   --token "${RUNNER_TOKEN}" \
-  --name "${NAME:-$(hostname)}" \
+  --name "${NAME:+${NAME}-}$(hostname)" \
   --unattended
 
 trap 'cleanup' SIGTERM

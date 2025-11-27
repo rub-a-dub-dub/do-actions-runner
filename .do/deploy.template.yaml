@@ -19,5 +19,6 @@ spec:
     git:
       branch: main
       repo_clone_url: https://github.com/rub-a-dub-dub/do-actions-runner.git
+    instance_count: 2
     instance_size_slug: basic-m
     name: do-actions-runner
