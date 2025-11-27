@@ -2,29 +2,34 @@
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "permissions": {
     "allow": [
-      "Bash(docker build*)",
-      "Bash(docker run*)",
-      "Bash(docker stop*)",
-      "Bash(docker ps*)",
-      "Bash(git status*)",
-      "Bash(git log*)",
-      "Bash(git diff*)",
-      "Bash(git branch*)",
-      "Bash(git checkout*)",
-      "Bash(git add*)",
-      "Bash(git pull*)",
-      "Bash(git fetch*)"
+      "Bash(docker build:*)",
+      "Bash(docker run:*)",
+      "Bash(docker stop:*)",
+      "Bash(docker ps:*)",
+      "Bash(git status:*)",
+      "Bash(git log:*)",
+      "Bash(git diff:*)",
+      "Bash(git branch:*)",
+      "Bash(git checkout:*)",
+      "Bash(git add:*)",
+      "Bash(git pull:*)",
+      "Bash(git fetch:*)",
+      "Bash(cat:*)",
+      "WebFetch(domain:github.com)",
+      "WebSearch",
+      "WebFetch(domain:docs.digitalocean.com)",
+      "mcp__digitalocean-mcp-local__*"
     ],
     "ask": [
-      "Bash(docker push*)",
-      "Bash(git commit*)",
-      "Bash(git push --force*)",
-      "Bash(git push -f*)"
+      "Bash(docker push:*)",
+      "Bash(git commit:*)",
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)"
     ],
     "deny": [
-      "Bash(*TOKEN*)",
-      "Bash(*SECRET*)",
-      "Bash(git restore*)"
+      "Bash(:*TOKEN:*)",
+      "Bash(:*SECRET:*)",
+      "Bash(git restore:*)"
     ]
   }
 }
