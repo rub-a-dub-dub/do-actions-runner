@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Copy CLAUDE.md to AGENTS.md if CLAUDE.md exists
+if [ -f "CLAUDE.md" ]; then
+  cp CLAUDE.md AGENTS.md
+  git add AGENTS.md
+fi
