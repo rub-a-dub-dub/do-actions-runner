@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build and Validate
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t do-actions-runner:test .
+
+      - name: Validate entrypoint exists and is executable
+        run: |
+          docker run --rm --entrypoint="" do-actions-runner:test \
+            test -x ./entrypoint.sh
+
+      - name: Validate runner binaries are present
+        run: |
+          docker run --rm --entrypoint="" do-actions-runner:test \
+            test -x ./run.sh
+          docker run --rm --entrypoint="" do-actions-runner:test \
+            test -x ./config.sh
+
+      - name: Validate entrypoint requires TOKEN
+        run: |
+          output=$(docker run --rm do-actions-runner:test 2>&1 || true)
+          echo "$output" | grep -q "TOKEN is required"
+
+      - name: Validate basic tools are installed
+        run: |
+          docker run --rm --entrypoint="" do-actions-runner:test \
+            bash -c "git --version && node --version && npm --version"
