@@ -43,3 +43,40 @@ spec:
     instance_count: 1
     instance_size_slug: apps-s-2vcpu-4gb
     name: runner-large
+  jobs:
+  - dockerfile_path: autoscaler/Dockerfile
+    envs:
+    - key: GITHUB_TOKEN
+      scope: RUN_TIME
+      type: SECRET
+      value: EV[GITHUB_PAT]
+    - key: DO_API_TOKEN
+      scope: RUN_TIME
+      type: SECRET
+      value: EV[DO_API_TOKEN]
+    - key: APP_ID
+      scope: RUN_TIME
+      value: EV[DO_APP_ID]
+    - key: OWNER
+      scope: RUN_TIME
+      value: EV[GITHUB_OWNER]
+    - key: REPO
+      scope: RUN_TIME
+      value: EV[GITHUB_REPO]
+    - key: WORKER_NAME
+      scope: RUN_TIME
+      value: runner-small
+    - key: MIN_INSTANCES
+      scope: RUN_TIME
+      value: "1"
+    - key: MAX_INSTANCES
+      scope: RUN_TIME
+      value: "5"
+    git:
+      branch: main
+      repo_clone_url: https://github.com/rub-a-dub-dub/do-actions-runner.git
+    instance_size_slug: apps-s-1vcpu-0.5gb
+    kind: SCHEDULED
+    name: autoscaler
+    schedule:
+      cron: "*/2 * * * *"
