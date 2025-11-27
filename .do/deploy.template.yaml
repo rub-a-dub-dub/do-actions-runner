@@ -7,9 +7,12 @@ spec:
       scope: RUN_TIME
       type: SECRET
       value: EV[GITHUB_PAT]
-    - key: ORG
+    - key: OWNER
       scope: RUN_TIME
-      value: EV[GITHUB_ORG]
+      value: EV[GITHUB_OWNER]
+    - key: REPO
+      scope: RUN_TIME
+      value: EV[GITHUB_REPO]
     - key: NAME
       scope: RUN_TIME
       value: do-actions-runner
