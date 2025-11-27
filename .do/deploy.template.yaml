@@ -79,4 +79,4 @@ spec:
     kind: SCHEDULED
     name: autoscaler
     schedule:
-      cron: "*/2 * * * *"
+      cron: "*/15 * * * *"
