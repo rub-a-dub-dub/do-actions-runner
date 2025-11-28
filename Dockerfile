@@ -26,6 +26,12 @@ RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - \
 
 WORKDIR /home/actions/actions-runner
 
+# Configure file descriptor limits for actions user (must be done as root)
+RUN echo "actions soft nofile 65536" >> /etc/security/limits.conf \
+    && echo "actions hard nofile 65536" >> /etc/security/limits.conf \
+    && echo "* soft nofile 65536" >> /etc/security/limits.conf \
+    && echo "* hard nofile 65536" >> /etc/security/limits.conf
+
 USER actions
 COPY --chown=actions:actions entrypoint.sh .
 RUN chmod u+x ./entrypoint.sh
