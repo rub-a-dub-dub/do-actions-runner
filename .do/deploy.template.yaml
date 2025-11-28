@@ -15,35 +15,13 @@ spec:
       value: EV[GITHUB_REPO]
     - key: NAME
       scope: RUN_TIME
-      value: runner-small
-    git:
-      branch: main
-      repo_clone_url: https://github.com/rub-a-dub-dub/do-actions-runner.git
-    instance_count: 2
-    instance_size_slug: apps-s-1vcpu-2gb
-    name: runner-small
-  - dockerfile_path: Dockerfile
-    envs:
-    - key: TOKEN
-      scope: RUN_TIME
-      type: SECRET
-      value: EV[GITHUB_PAT]
-    - key: OWNER
-      scope: RUN_TIME
-      value: EV[GITHUB_OWNER]
-    - key: REPO
-      scope: RUN_TIME
-      value: EV[GITHUB_REPO]
-    - key: NAME
-      scope: RUN_TIME
-      value: runner-large
+      value: runner
     git:
       branch: main
       repo_clone_url: https://github.com/rub-a-dub-dub/do-actions-runner.git
     instance_count: 1
     instance_size_slug: apps-s-2vcpu-4gb
-    name: runner-large
-  jobs:
+    name: runner
   - dockerfile_path: autoscaler/Dockerfile
     envs:
     - key: GITHUB_TOKEN
@@ -65,18 +43,19 @@ spec:
       value: EV[GITHUB_REPO]
     - key: WORKER_NAME
       scope: RUN_TIME
-      value: runner-small
+      value: runner
     - key: MIN_INSTANCES
       scope: RUN_TIME
       value: "1"
     - key: MAX_INSTANCES
       scope: RUN_TIME
       value: "5"
+    - key: POLL_INTERVAL
+      scope: RUN_TIME
+      value: "60"
     git:
       branch: main
       repo_clone_url: https://github.com/rub-a-dub-dub/do-actions-runner.git
+    instance_count: 1
     instance_size_slug: apps-s-1vcpu-0.5gb
-    kind: SCHEDULED
     name: autoscaler
-    schedule:
-      cron: "*/15 * * * *"

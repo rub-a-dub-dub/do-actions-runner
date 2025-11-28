@@ -7,6 +7,7 @@ Polls GitHub API for queued jobs and scales runner workers accordingly.
 
 import os
 import sys
+import time
 
 import requests
 
@@ -21,10 +22,11 @@ OWNER = os.environ.get("OWNER")
 REPO = os.environ.get("REPO")
 
 # Scaling configuration
-WORKER_NAME = os.environ.get("WORKER_NAME", "runner-small")
+WORKER_NAME = os.environ.get("WORKER_NAME", "runner")
 MIN_INSTANCES = int(os.environ.get("MIN_INSTANCES", "1"))
 MAX_INSTANCES = int(os.environ.get("MAX_INSTANCES", "5"))
 JOBS_PER_RUNNER = int(os.environ.get("JOBS_PER_RUNNER", "1"))
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "60"))
 
 GITHUB_API = "https://api.github.com"
 DO_API = "https://api.digitalocean.com/v2"
@@ -117,33 +119,35 @@ def calculate_desired_instances(queued_jobs: int) -> int:
 
 
 def main():
-    """Main autoscaler entry point (runs once per scheduled invocation)."""
-    print("Running GitHub Actions Runner Autoscaler")
+    """Main autoscaler loop (runs continuously)."""
+    print("Starting GitHub Actions Runner Autoscaler")
     print(f"  Worker: {WORKER_NAME}")
     print(f"  Min instances: {MIN_INSTANCES}")
     print(f"  Max instances: {MAX_INSTANCES}")
+    print(f"  Poll interval: {POLL_INTERVAL}s")
 
     if not all([GITHUB_TOKEN, DO_API_TOKEN, APP_ID]):
         print("ERROR: GITHUB_TOKEN, DO_API_TOKEN, and APP_ID are required")
         sys.exit(1)
 
-    try:
-        queued = get_queued_jobs()
-        current = get_current_instance_count()
-        desired = calculate_desired_instances(queued)
+    while True:
+        try:
+            queued = get_queued_jobs()
+            current = get_current_instance_count()
+            desired = calculate_desired_instances(queued)
 
-        if desired != current:
-            print(f"Scaling {WORKER_NAME}: {current} -> {desired}")
-            scale_worker(desired)
-        else:
-            print(f"No scaling needed ({current} instances)")
+            if desired != current:
+                print(f"Scaling {WORKER_NAME}: {current} -> {desired}")
+                scale_worker(desired)
+            else:
+                print(f"No scaling needed ({current} instances)")
 
-    except requests.RequestException as e:
-        print(f"API error: {e}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"Error: {e}")
-        sys.exit(1)
+        except requests.RequestException as e:
+            print(f"API error: {e}")
+        except Exception as e:
+            print(f"Error: {e}")
+
+        time.sleep(POLL_INTERVAL)
 
 
 if __name__ == "__main__":
