@@ -66,27 +66,66 @@ class ScalingState:
 
 
 def get_queued_jobs() -> int:
-    """Get count of queued workflow jobs from GitHub."""
+    """Get count of queued workflow jobs from GitHub.
+
+    This counts actual jobs (not runs), since a single workflow run
+    can have multiple jobs that need runner capacity.
+    """
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github.v3+json",
     }
 
+    # First, get runs that are queued or in_progress (jobs may be waiting)
     if ORG:
-        # Org-level: list all queued runs across the org
-        url = f"{GITHUB_API}/orgs/{ORG}/actions/runs?status=queued&per_page=100"
+        runs_url = f"{GITHUB_API}/orgs/{ORG}/actions/runs?status=queued&per_page=100"
+        in_progress_url = f"{GITHUB_API}/orgs/{ORG}/actions/runs?status=in_progress&per_page=100"
     elif OWNER and REPO:
-        # Repo-level
-        url = f"{GITHUB_API}/repos/{OWNER}/{REPO}/actions/runs?status=queued&per_page=100"
+        runs_url = f"{GITHUB_API}/repos/{OWNER}/{REPO}/actions/runs?status=queued&per_page=100"
+        in_progress_url = f"{GITHUB_API}/repos/{OWNER}/{REPO}/actions/runs?status=in_progress&per_page=100"
     else:
         log.error("ORG or (OWNER and REPO) must be set")
         sys.exit(1)
 
-    resp = requests.get(url, headers=headers)
-    resp.raise_for_status()
-    data = resp.json()
+    # Collect all runs that might have queued jobs
+    all_runs = []
 
-    queued_count = data.get("total_count", 0)
+    resp = requests.get(runs_url, headers=headers)
+    resp.raise_for_status()
+    all_runs.extend(resp.json().get("workflow_runs", []))
+
+    resp = requests.get(in_progress_url, headers=headers)
+    resp.raise_for_status()
+    all_runs.extend(resp.json().get("workflow_runs", []))
+
+    # Count queued jobs across all runs
+    queued_count = 0
+    for run in all_runs:
+        run_id = run.get("id")
+        if not run_id:
+            continue
+
+        # Get jobs for this run
+        if ORG:
+            # For org-level, we need the repo info from the run
+            repo_full_name = run.get("repository", {}).get("full_name", "")
+            if not repo_full_name:
+                continue
+            jobs_url = f"{GITHUB_API}/repos/{repo_full_name}/actions/runs/{run_id}/jobs?per_page=100"
+        else:
+            jobs_url = f"{GITHUB_API}/repos/{OWNER}/{REPO}/actions/runs/{run_id}/jobs?per_page=100"
+
+        try:
+            jobs_resp = requests.get(jobs_url, headers=headers)
+            jobs_resp.raise_for_status()
+            jobs = jobs_resp.json().get("jobs", [])
+
+            for job in jobs:
+                if job.get("status") == "queued":
+                    queued_count += 1
+        except requests.RequestException as e:
+            log.warning(f"Failed to get jobs for run {run_id}: {e}")
+
     log.info(f"Queued jobs: {queued_count}")
     return queued_count
 

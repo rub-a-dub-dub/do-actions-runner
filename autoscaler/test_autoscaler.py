@@ -240,36 +240,82 @@ class TestGetQueuedJobs:
     """Tests for get_queued_jobs function."""
 
     @patch("autoscaler.requests.get")
-    def test_repo_level_api_call(self, mock_get):
-        """Should call repo-level API when OWNER and REPO are set."""
-        mock_response = MagicMock()
-        mock_response.json.return_value = {"total_count": 5}
-        mock_get.return_value = mock_response
+    def test_counts_queued_jobs_not_runs(self, mock_get):
+        """Should count actual queued jobs, not workflow runs."""
+        # Mock responses for runs (queued), runs (in_progress), and jobs
+        def mock_get_side_effect(url, headers=None):
+            mock_resp = MagicMock()
+            if "status=queued" in url and "actions/runs" in url:
+                # One queued run
+                mock_resp.json.return_value = {
+                    "workflow_runs": [{"id": 123}]
+                }
+            elif "status=in_progress" in url and "actions/runs" in url:
+                # One in-progress run
+                mock_resp.json.return_value = {
+                    "workflow_runs": [{"id": 456}]
+                }
+            elif "runs/123/jobs" in url:
+                # Run 123 has 2 queued jobs
+                mock_resp.json.return_value = {
+                    "jobs": [
+                        {"status": "queued"},
+                        {"status": "queued"},
+                    ]
+                }
+            elif "runs/456/jobs" in url:
+                # Run 456 has 1 queued job and 1 in_progress
+                mock_resp.json.return_value = {
+                    "jobs": [
+                        {"status": "queued"},
+                        {"status": "in_progress"},
+                    ]
+                }
+            else:
+                mock_resp.json.return_value = {}
+            return mock_resp
+
+        mock_get.side_effect = mock_get_side_effect
 
         with patch.object(autoscaler, "ORG", None):
             with patch.object(autoscaler, "OWNER", "test-owner"):
                 with patch.object(autoscaler, "REPO", "test-repo"):
                     result = autoscaler.get_queued_jobs()
 
-        assert result == 5
-        mock_get.assert_called_once()
-        call_url = mock_get.call_args[0][0]
-        assert "repos/test-owner/test-repo/actions/runs" in call_url
-        assert "status=queued" in call_url
+        # 2 queued from run 123 + 1 queued from run 456 = 3
+        assert result == 3
 
     @patch("autoscaler.requests.get")
     def test_org_level_api_call(self, mock_get):
         """Should call org-level API when ORG is set."""
-        mock_response = MagicMock()
-        mock_response.json.return_value = {"total_count": 3}
-        mock_get.return_value = mock_response
+        def mock_get_side_effect(url, headers=None):
+            mock_resp = MagicMock()
+            if "orgs/test-org/actions/runs" in url:
+                if "status=queued" in url:
+                    mock_resp.json.return_value = {
+                        "workflow_runs": [
+                            {"id": 789, "repository": {"full_name": "test-org/repo1"}}
+                        ]
+                    }
+                else:
+                    mock_resp.json.return_value = {"workflow_runs": []}
+            elif "runs/789/jobs" in url:
+                mock_resp.json.return_value = {
+                    "jobs": [{"status": "queued"}]
+                }
+            else:
+                mock_resp.json.return_value = {}
+            return mock_resp
+
+        mock_get.side_effect = mock_get_side_effect
 
         with patch.object(autoscaler, "ORG", "test-org"):
             result = autoscaler.get_queued_jobs()
 
-        assert result == 3
-        call_url = mock_get.call_args[0][0]
-        assert "orgs/test-org/actions/runs" in call_url
+        assert result == 1
+        # Verify org-level runs API was called
+        calls = [str(c) for c in mock_get.call_args_list]
+        assert any("orgs/test-org/actions/runs" in c for c in calls)
 
 
 class TestGetCurrentInstanceCount:
