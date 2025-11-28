@@ -7,12 +7,22 @@ Includes cooldown periods, hysteresis thresholds, and stabilization windows
 to prevent thrashing.
 """
 
+import logging
 import os
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import requests
+
+# Configure logging with timestamps
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+log = logging.getLogger(__name__)
 
 # Configuration from environment
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
@@ -69,7 +79,7 @@ def get_queued_jobs() -> int:
         # Repo-level
         url = f"{GITHUB_API}/repos/{OWNER}/{REPO}/actions/runs?status=queued&per_page=100"
     else:
-        print("ERROR: ORG or (OWNER and REPO) must be set")
+        log.error("ORG or (OWNER and REPO) must be set")
         sys.exit(1)
 
     resp = requests.get(url, headers=headers)
@@ -77,7 +87,7 @@ def get_queued_jobs() -> int:
     data = resp.json()
 
     queued_count = data.get("total_count", 0)
-    print(f"Queued jobs: {queued_count}")
+    log.info(f"Queued jobs: {queued_count}")
     return queued_count
 
 
@@ -93,10 +103,10 @@ def get_current_instance_count() -> int:
     for worker in app.get("spec", {}).get("workers", []):
         if worker.get("name") == WORKER_NAME:
             count = worker.get("instance_count", 1)
-            print(f"Current {WORKER_NAME} instances: {count}")
+            log.info(f"Current {WORKER_NAME} instances: {count}")
             return count
 
-    print(f"WARNING: Worker '{WORKER_NAME}' not found in app spec")
+    log.warning(f"Worker '{WORKER_NAME}' not found in app spec")
     return 1
 
 
@@ -122,7 +132,7 @@ def scale_worker(desired_count: int) -> None:
             break
 
     if not updated:
-        print(f"ERROR: Worker '{WORKER_NAME}' not found")
+        log.error(f"Worker '{WORKER_NAME}' not found")
         return
 
     # Apply updated spec
@@ -132,7 +142,7 @@ def scale_worker(desired_count: int) -> None:
         json={"spec": spec},
     )
     resp.raise_for_status()
-    print(f"Scaled {WORKER_NAME} to {desired_count} instances")
+    log.info(f"Scaled {WORKER_NAME} to {desired_count} instances")
 
 
 def should_scale_up(queued: int, current: int) -> bool:
@@ -173,7 +183,7 @@ def evaluate_scaling(
     if should_scale_up(queued, current):
         state.consecutive_scale_up_readings += 1
         state.consecutive_scale_down_readings = 0
-        print(
+        log.info(
             f"Scale-up condition met ({queued} > {current * SCALE_UP_THRESHOLD:.1f}), "
             f"readings: {state.consecutive_scale_up_readings}/{STABILIZATION_WINDOW}"
         )
@@ -181,20 +191,20 @@ def evaluate_scaling(
         if state.consecutive_scale_up_readings >= STABILIZATION_WINDOW:
             if is_cooldown_active(state, "up"):
                 remaining = SCALE_UP_COOLDOWN - (time.time() - state.last_scale_time)
-                print(f"Scale-up blocked by cooldown ({remaining:.0f}s remaining)")
+                log.info(f"Scale-up blocked by cooldown ({remaining:.0f}s remaining)")
                 return ("none", current)
 
             new_count = min(current + 1, MAX_INSTANCES)
             if new_count > current:
                 return ("up", new_count)
             else:
-                print(f"Already at MAX_INSTANCES ({MAX_INSTANCES})")
+                log.info(f"Already at MAX_INSTANCES ({MAX_INSTANCES})")
 
     # Check scale-down condition
     elif should_scale_down(queued, current):
         state.consecutive_scale_down_readings += 1
         state.consecutive_scale_up_readings = 0
-        print(
+        log.info(
             f"Scale-down condition met ({queued} < {current * SCALE_DOWN_THRESHOLD:.1f}), "
             f"readings: {state.consecutive_scale_down_readings}/{STABILIZATION_WINDOW}"
         )
@@ -202,20 +212,20 @@ def evaluate_scaling(
         if state.consecutive_scale_down_readings >= STABILIZATION_WINDOW:
             if is_cooldown_active(state, "down"):
                 remaining = SCALE_DOWN_COOLDOWN - (time.time() - state.last_scale_time)
-                print(f"Scale-down blocked by cooldown ({remaining:.0f}s remaining)")
+                log.info(f"Scale-down blocked by cooldown ({remaining:.0f}s remaining)")
                 return ("none", current)
 
             new_count = max(current - 1, MIN_INSTANCES)
             if new_count < current:
                 return ("down", new_count)
             else:
-                print(f"Already at MIN_INSTANCES ({MIN_INSTANCES})")
+                log.info(f"Already at MIN_INSTANCES ({MIN_INSTANCES})")
 
     # No scaling condition met - reset counters
     else:
         state.consecutive_scale_up_readings = 0
         state.consecutive_scale_down_readings = 0
-        print(f"Queue stable (no scaling thresholds met)")
+        log.debug("Queue stable (no scaling thresholds met)")
 
     return ("none", current)
 
@@ -268,7 +278,7 @@ def cleanup_dead_runners() -> int:
     try:
         runners = get_runners()
     except requests.RequestException as e:
-        print(f"Failed to get runners: {e}")
+        log.error(f"Failed to get runners: {e}")
         return 0
 
     deleted = 0
@@ -280,36 +290,36 @@ def cleanup_dead_runners() -> int:
 
         # Only delete offline runners that are not busy
         if status == "offline" and not busy and runner_id:
-            print(f"Removing dead runner: {name} (ID: {runner_id})")
+            log.info(f"Removing dead runner: {name} (ID: {runner_id})")
             try:
                 if delete_runner(runner_id):
                     deleted += 1
-                    print(f"  Deleted runner {name}")
+                    log.info(f"  Deleted runner {name}")
                 else:
-                    print(f"  Failed to delete runner {name}")
+                    log.warning(f"  Failed to delete runner {name}")
             except requests.RequestException as e:
-                print(f"  Error deleting runner {name}: {e}")
+                log.error(f"  Error deleting runner {name}: {e}")
 
     if deleted > 0:
-        print(f"Cleaned up {deleted} dead runner(s)")
+        log.info(f"Cleaned up {deleted} dead runner(s)")
     return deleted
 
 
 def main():
     """Main autoscaler loop (runs continuously)."""
-    print("Starting GitHub Actions Runner Autoscaler")
-    print(f"  Worker: {WORKER_NAME}")
-    print(f"  Min instances: {MIN_INSTANCES}")
-    print(f"  Max instances: {MAX_INSTANCES}")
-    print(f"  Poll interval: {POLL_INTERVAL}s")
-    print(f"  Scale-up threshold: {SCALE_UP_THRESHOLD}x capacity")
-    print(f"  Scale-down threshold: {SCALE_DOWN_THRESHOLD}x capacity")
-    print(f"  Scale-up cooldown: {SCALE_UP_COOLDOWN}s")
-    print(f"  Scale-down cooldown: {SCALE_DOWN_COOLDOWN}s")
-    print(f"  Stabilization window: {STABILIZATION_WINDOW} readings")
+    log.info("Starting GitHub Actions Runner Autoscaler")
+    log.info(f"  Worker: {WORKER_NAME}")
+    log.info(f"  Min instances: {MIN_INSTANCES}")
+    log.info(f"  Max instances: {MAX_INSTANCES}")
+    log.info(f"  Poll interval: {POLL_INTERVAL}s")
+    log.info(f"  Scale-up threshold: {SCALE_UP_THRESHOLD}x capacity")
+    log.info(f"  Scale-down threshold: {SCALE_DOWN_THRESHOLD}x capacity")
+    log.info(f"  Scale-up cooldown: {SCALE_UP_COOLDOWN}s")
+    log.info(f"  Scale-down cooldown: {SCALE_DOWN_COOLDOWN}s")
+    log.info(f"  Stabilization window: {STABILIZATION_WINDOW} readings")
 
     if not all([GITHUB_TOKEN, DO_API_TOKEN, APP_ID]):
-        print("ERROR: GITHUB_TOKEN, DO_API_TOKEN, and APP_ID are required")
+        log.error("GITHUB_TOKEN, DO_API_TOKEN, and APP_ID are required")
         sys.exit(1)
 
     state = ScalingState()
@@ -325,7 +335,7 @@ def main():
             action, new_count = evaluate_scaling(queued, current, state)
 
             if action != "none":
-                print(f"Scaling {WORKER_NAME}: {current} -> {new_count}")
+                log.info(f"Scaling {WORKER_NAME}: {current} -> {new_count}")
                 scale_worker(new_count)
                 state.last_scale_time = time.time()
                 state.last_scale_direction = action
@@ -333,12 +343,12 @@ def main():
                 state.consecutive_scale_up_readings = 0
                 state.consecutive_scale_down_readings = 0
             else:
-                print(f"No scaling action ({current} instances)")
+                log.debug(f"No scaling action ({current} instances)")
 
         except requests.RequestException as e:
-            print(f"API error: {e}")
+            log.error(f"API error: {e}")
         except Exception as e:
-            print(f"Error: {e}")
+            log.exception(f"Unexpected error: {e}")
 
         time.sleep(POLL_INTERVAL)
 
