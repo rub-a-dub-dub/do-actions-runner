@@ -220,6 +220,81 @@ def evaluate_scaling(
     return ("none", current)
 
 
+def get_runners() -> list[dict]:
+    """Get list of all registered runners from GitHub."""
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
+    if ORG:
+        url = f"{GITHUB_API}/orgs/{ORG}/actions/runners?per_page=100"
+    elif OWNER and REPO:
+        url = f"{GITHUB_API}/repos/{OWNER}/{REPO}/actions/runners?per_page=100"
+    else:
+        return []
+
+    resp = requests.get(url, headers=headers)
+    resp.raise_for_status()
+    data = resp.json()
+
+    return data.get("runners", [])
+
+
+def delete_runner(runner_id: int) -> bool:
+    """Delete a runner by ID from GitHub."""
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
+    if ORG:
+        url = f"{GITHUB_API}/orgs/{ORG}/actions/runners/{runner_id}"
+    elif OWNER and REPO:
+        url = f"{GITHUB_API}/repos/{OWNER}/{REPO}/actions/runners/{runner_id}"
+    else:
+        return False
+
+    resp = requests.delete(url, headers=headers)
+    return resp.status_code == 204
+
+
+def cleanup_dead_runners() -> int:
+    """Remove offline runners that are not busy.
+
+    Returns:
+        Number of runners deleted.
+    """
+    try:
+        runners = get_runners()
+    except requests.RequestException as e:
+        print(f"Failed to get runners: {e}")
+        return 0
+
+    deleted = 0
+    for runner in runners:
+        status = runner.get("status", "")
+        busy = runner.get("busy", False)
+        name = runner.get("name", "unknown")
+        runner_id = runner.get("id")
+
+        # Only delete offline runners that are not busy
+        if status == "offline" and not busy and runner_id:
+            print(f"Removing dead runner: {name} (ID: {runner_id})")
+            try:
+                if delete_runner(runner_id):
+                    deleted += 1
+                    print(f"  Deleted runner {name}")
+                else:
+                    print(f"  Failed to delete runner {name}")
+            except requests.RequestException as e:
+                print(f"  Error deleting runner {name}: {e}")
+
+    if deleted > 0:
+        print(f"Cleaned up {deleted} dead runner(s)")
+    return deleted
+
+
 def main():
     """Main autoscaler loop (runs continuously)."""
     print("Starting GitHub Actions Runner Autoscaler")
@@ -241,6 +316,9 @@ def main():
 
     while True:
         try:
+            # Clean up any dead runners first
+            cleanup_dead_runners()
+
             queued = get_queued_jobs()
             current = get_current_instance_count()
 

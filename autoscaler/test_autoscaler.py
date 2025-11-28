@@ -362,5 +362,130 @@ class TestScaleWorker:
         mock_put.assert_not_called()
 
 
+class TestGetRunners:
+    """Tests for get_runners function."""
+
+    @patch("autoscaler.requests.get")
+    def test_returns_runners_list(self, mock_get):
+        """Should return list of runners."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "total_count": 2,
+            "runners": [
+                {"id": 1, "name": "runner-1", "status": "online", "busy": False},
+                {"id": 2, "name": "runner-2", "status": "offline", "busy": False},
+            ],
+        }
+        mock_get.return_value = mock_response
+
+        with patch.object(autoscaler, "ORG", None):
+            with patch.object(autoscaler, "OWNER", "test-owner"):
+                with patch.object(autoscaler, "REPO", "test-repo"):
+                    result = autoscaler.get_runners()
+
+        assert len(result) == 2
+        assert result[0]["name"] == "runner-1"
+
+    @patch("autoscaler.requests.get")
+    def test_org_level_api_call(self, mock_get):
+        """Should call org-level API when ORG is set."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"runners": []}
+        mock_get.return_value = mock_response
+
+        with patch.object(autoscaler, "ORG", "test-org"):
+            autoscaler.get_runners()
+
+        call_url = mock_get.call_args[0][0]
+        assert "orgs/test-org/actions/runners" in call_url
+
+
+class TestDeleteRunner:
+    """Tests for delete_runner function."""
+
+    @patch("autoscaler.requests.delete")
+    def test_returns_true_on_success(self, mock_delete):
+        """Should return True when deletion succeeds."""
+        mock_response = MagicMock()
+        mock_response.status_code = 204
+        mock_delete.return_value = mock_response
+
+        with patch.object(autoscaler, "ORG", None):
+            with patch.object(autoscaler, "OWNER", "test-owner"):
+                with patch.object(autoscaler, "REPO", "test-repo"):
+                    result = autoscaler.delete_runner(123)
+
+        assert result is True
+
+    @patch("autoscaler.requests.delete")
+    def test_returns_false_on_failure(self, mock_delete):
+        """Should return False when deletion fails."""
+        mock_response = MagicMock()
+        mock_response.status_code = 404
+        mock_delete.return_value = mock_response
+
+        with patch.object(autoscaler, "ORG", None):
+            with patch.object(autoscaler, "OWNER", "test-owner"):
+                with patch.object(autoscaler, "REPO", "test-repo"):
+                    result = autoscaler.delete_runner(123)
+
+        assert result is False
+
+
+class TestCleanupDeadRunners:
+    """Tests for cleanup_dead_runners function."""
+
+    @patch("autoscaler.delete_runner")
+    @patch("autoscaler.get_runners")
+    def test_deletes_offline_runners(self, mock_get_runners, mock_delete):
+        """Should delete offline, non-busy runners."""
+        mock_get_runners.return_value = [
+            {"id": 1, "name": "runner-1", "status": "online", "busy": False},
+            {"id": 2, "name": "runner-2", "status": "offline", "busy": False},
+            {"id": 3, "name": "runner-3", "status": "offline", "busy": True},
+        ]
+        mock_delete.return_value = True
+
+        result = autoscaler.cleanup_dead_runners()
+
+        assert result == 1
+        mock_delete.assert_called_once_with(2)
+
+    @patch("autoscaler.delete_runner")
+    @patch("autoscaler.get_runners")
+    def test_skips_busy_runners(self, mock_get_runners, mock_delete):
+        """Should not delete busy runners even if offline."""
+        mock_get_runners.return_value = [
+            {"id": 1, "name": "runner-1", "status": "offline", "busy": True},
+        ]
+
+        result = autoscaler.cleanup_dead_runners()
+
+        assert result == 0
+        mock_delete.assert_not_called()
+
+    @patch("autoscaler.delete_runner")
+    @patch("autoscaler.get_runners")
+    def test_skips_online_runners(self, mock_get_runners, mock_delete):
+        """Should not delete online runners."""
+        mock_get_runners.return_value = [
+            {"id": 1, "name": "runner-1", "status": "online", "busy": False},
+        ]
+
+        result = autoscaler.cleanup_dead_runners()
+
+        assert result == 0
+        mock_delete.assert_not_called()
+
+    @patch("autoscaler.get_runners")
+    def test_handles_api_error(self, mock_get_runners):
+        """Should return 0 and not crash on API error."""
+        mock_get_runners.side_effect = autoscaler.requests.RequestException("API Error")
+
+        result = autoscaler.cleanup_dead_runners()
+
+        assert result == 0
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
