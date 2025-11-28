@@ -48,9 +48,13 @@ SCALE_DOWN_COOLDOWN = int(os.environ.get("SCALE_DOWN_COOLDOWN", "180"))  # secon
 SCALE_UP_THRESHOLD = float(os.environ.get("SCALE_UP_THRESHOLD", "1.5"))
 SCALE_DOWN_THRESHOLD = float(os.environ.get("SCALE_DOWN_THRESHOLD", "0.25"))
 
-# Step sizes for scaling
+# Step sizes for scaling (these are maximums when using proportional scaling)
 SCALE_UP_STEP = int(os.environ.get("SCALE_UP_STEP", "2"))
 SCALE_DOWN_STEP = int(os.environ.get("SCALE_DOWN_STEP", "1"))
+
+# Proportional scaling factors (fraction of deficit/excess to scale by)
+SCALE_UP_PROPORTION = float(os.environ.get("SCALE_UP_PROPORTION", "0.5"))
+SCALE_DOWN_PROPORTION = float(os.environ.get("SCALE_DOWN_PROPORTION", "0.5"))
 
 # Stabilization with time decay
 STABILIZATION_WINDOW_MINUTES = int(os.environ.get("STABILIZATION_WINDOW_MINUTES", "3"))
@@ -89,6 +93,10 @@ def validate_config() -> None:
         errors.append("DECAY_HALF_LIFE_SECONDS must be > 0")
     if BREACH_THRESHOLD <= 0:
         errors.append("BREACH_THRESHOLD must be > 0")
+    if not 0 < SCALE_UP_PROPORTION <= 1:
+        errors.append("SCALE_UP_PROPORTION must be > 0 and <= 1")
+    if not 0 < SCALE_DOWN_PROPORTION <= 1:
+        errors.append("SCALE_DOWN_PROPORTION must be > 0 and <= 1")
 
     if errors:
         for e in errors:
@@ -345,7 +353,11 @@ def evaluate_scaling(
                 log.info(f"Scale-up blocked by cooldown ({remaining:.0f}s remaining)")
                 return ("none", current)
 
-            new_count = min(current + SCALE_UP_STEP, MAX_INSTANCES)
+            # Proportional scaling: scale by fraction of deficit, capped at SCALE_UP_STEP
+            deficit = demand - current
+            step = min(max(int(deficit * SCALE_UP_PROPORTION), 1), SCALE_UP_STEP)
+            new_count = min(current + step, MAX_INSTANCES)
+            log.info(f"Scale-up step: {step} (deficit={deficit}, proportion={SCALE_UP_PROPORTION})")
             if new_count > current:
                 return ("up", new_count)
             else:
@@ -366,7 +378,11 @@ def evaluate_scaling(
                 log.info(f"Scale-down blocked by cooldown ({remaining:.0f}s remaining)")
                 return ("none", current)
 
-            new_count = max(current - SCALE_DOWN_STEP, MIN_INSTANCES)
+            # Proportional scaling: scale by fraction of excess, capped at SCALE_DOWN_STEP
+            excess = current - demand
+            step = min(max(int(excess * SCALE_DOWN_PROPORTION), 1), SCALE_DOWN_STEP)
+            new_count = max(current - step, MIN_INSTANCES)
+            log.info(f"Scale-down step: {step} (excess={excess}, proportion={SCALE_DOWN_PROPORTION})")
             if new_count < current:
                 return ("down", new_count)
             else:
@@ -468,8 +484,10 @@ def main():
     log.info(f"  Stabilization window: {STABILIZATION_WINDOW_MINUTES}min")
     log.info(f"  Decay half-life: {DECAY_HALF_LIFE_SECONDS}s")
     log.info(f"  Breach threshold: {BREACH_THRESHOLD}")
-    log.info(f"  Scale-up step: +{SCALE_UP_STEP}")
-    log.info(f"  Scale-down step: -{SCALE_DOWN_STEP}")
+    log.info(f"  Scale-up step: +{SCALE_UP_STEP} (max)")
+    log.info(f"  Scale-down step: -{SCALE_DOWN_STEP} (max)")
+    log.info(f"  Scale-up proportion: {SCALE_UP_PROPORTION}")
+    log.info(f"  Scale-down proportion: {SCALE_DOWN_PROPORTION}")
 
     if not all([GITHUB_TOKEN, DO_API_TOKEN, APP_ID]):
         log.error("GITHUB_TOKEN, DO_API_TOKEN, and APP_ID are required")

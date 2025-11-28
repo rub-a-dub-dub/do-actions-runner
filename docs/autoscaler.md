@@ -75,14 +75,29 @@ Scaling triggers when `breach_score >= BREACH_THRESHOLD`.
 - Brief fluctuations don't completely reset progress
 - Natural smoothing of noisy data
 
-### 3. Step-Based Scaling
+### 3. Proportional Scaling with Step Maximums
 
-Scaling uses asymmetric step sizes to handle bursts efficiently while scaling down conservatively:
+Scaling is proportional to the demand gap, with configurable maximum step sizes:
 
-- **Scale-up**: Add `SCALE_UP_STEP` instances (default: +2)
-- **Scale-down**: Remove `SCALE_DOWN_STEP` instances (default: -1)
+**Scale-up formula:**
+```
+deficit = demand - current_instances
+step = min(max(int(deficit × SCALE_UP_PROPORTION), 1), SCALE_UP_STEP)
+new_count = min(current + step, MAX_INSTANCES)
+```
 
-This allows the system to react quickly to job bursts while scaling down gradually as load decreases.
+**Scale-down formula:**
+```
+excess = current_instances - demand
+step = min(max(int(excess × SCALE_DOWN_PROPORTION), 1), SCALE_DOWN_STEP)
+new_count = max(current - step, MIN_INSTANCES)
+```
+
+This approach:
+- Scales faster when the gap is large (proportional to deficit/excess)
+- Never adds/removes more than `SCALE_UP_STEP`/`SCALE_DOWN_STEP` at once (safety cap)
+- Always changes by at least 1 instance when triggered (minimum step)
+- Allows asymmetric behavior (fast scale-up, conservative scale-down)
 
 ### 4. Independent Cooldown Periods
 
@@ -121,8 +136,10 @@ This handles runners that crashed without deregistering.
 | `SCALE_DOWN_THRESHOLD` | `0.25` | Multiplier for scale-down trigger |
 | `SCALE_UP_COOLDOWN` | `60` | Seconds to wait after scale-up |
 | `SCALE_DOWN_COOLDOWN` | `180` | Seconds to wait after scale-down |
-| `SCALE_UP_STEP` | `2` | Instances to add when scaling up |
-| `SCALE_DOWN_STEP` | `1` | Instances to remove when scaling down |
+| `SCALE_UP_STEP` | `2` | Maximum instances to add when scaling up |
+| `SCALE_DOWN_STEP` | `1` | Maximum instances to remove when scaling down |
+| `SCALE_UP_PROPORTION` | `0.5` | Fraction of deficit to scale up by |
+| `SCALE_DOWN_PROPORTION` | `0.5` | Fraction of excess to scale down by |
 | `STABILIZATION_WINDOW_MINUTES` | `3` | Time window for breach history |
 | `DECAY_HALF_LIFE_SECONDS` | `30` | Half-life for breach score decay |
 | `BREACH_THRESHOLD` | `2.0` | Score needed to trigger scaling |

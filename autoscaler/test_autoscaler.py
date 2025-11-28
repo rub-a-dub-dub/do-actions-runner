@@ -216,7 +216,7 @@ class TestEvaluateScaling:
         return state
 
     def test_scale_up_after_breach_threshold(self):
-        """Should scale up by SCALE_UP_STEP after breach threshold is met."""
+        """Should scale up proportionally after breach threshold is met."""
         # Pre-populate with enough breaches to be just under threshold
         state = self._create_state_with_breach_score("up", 1.5)
 
@@ -227,13 +227,15 @@ class TestEvaluateScaling:
                         with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
                             with patch.object(autoscaler, "MAX_INSTANCES", 5):
                                 with patch.object(autoscaler, "SCALE_UP_STEP", 2):
-                                    # demand=4, current=2: 4 > 2*1.5=3.0, should trigger scale-up
-                                    action, new_count = autoscaler.evaluate_scaling(
-                                        demand=4, current=2, state=state
-                                    )
+                                    with patch.object(autoscaler, "SCALE_UP_PROPORTION", 0.5):
+                                        # demand=4, current=2: 4 > 2*1.5=3.0, should trigger scale-up
+                                        # deficit=2, step=min(max(int(2*0.5),1),2)=1
+                                        action, new_count = autoscaler.evaluate_scaling(
+                                            demand=4, current=2, state=state
+                                        )
 
         assert action == "up"
-        assert new_count == 4  # +2 from current (SCALE_UP_STEP=2)
+        assert new_count == 3  # +1 from current (proportional: deficit=2, 2*0.5=1)
 
     def test_scale_up_blocked_before_breach_threshold(self):
         """Should not scale up before breach threshold is met."""
@@ -275,7 +277,7 @@ class TestEvaluateScaling:
         assert new_count == 2
 
     def test_scale_down_after_breach_threshold(self):
-        """Should scale down by SCALE_DOWN_STEP after breach threshold is met."""
+        """Should scale down proportionally after breach threshold is met."""
         state = self._create_state_with_breach_score("down", 1.5)
 
         with patch.object(autoscaler, "SCALE_UP_THRESHOLD", 1.5):
@@ -285,13 +287,15 @@ class TestEvaluateScaling:
                         with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
                             with patch.object(autoscaler, "MIN_INSTANCES", 1):
                                 with patch.object(autoscaler, "SCALE_DOWN_STEP", 1):
-                                    # demand=0, current=4: 0 < 4*0.25=1.0, should trigger scale-down
-                                    action, new_count = autoscaler.evaluate_scaling(
-                                        demand=0, current=4, state=state
-                                    )
+                                    with patch.object(autoscaler, "SCALE_DOWN_PROPORTION", 0.5):
+                                        # demand=0, current=4: 0 < 4*0.25=1.0, should trigger scale-down
+                                        # excess=4, step=min(max(int(4*0.5),1),1)=min(2,1)=1
+                                        action, new_count = autoscaler.evaluate_scaling(
+                                            demand=0, current=4, state=state
+                                        )
 
         assert action == "down"
-        assert new_count == 3  # -1 from current (SCALE_DOWN_STEP=1)
+        assert new_count == 3  # -1 from current (capped at SCALE_DOWN_STEP=1)
 
     def test_scale_down_blocked_by_cooldown(self):
         """Should not scale down during cooldown even if breach threshold met."""
@@ -390,16 +394,18 @@ class TestEvaluateScaling:
                         with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
                             with patch.object(autoscaler, "MAX_INSTANCES", 5):
                                 with patch.object(autoscaler, "SCALE_UP_STEP", 2):
-                                    # current=4, step=2, max=5 -> should go to 5, not 6
-                                    action, new_count = autoscaler.evaluate_scaling(
-                                        demand=10, current=4, state=state
-                                    )
+                                    with patch.object(autoscaler, "SCALE_UP_PROPORTION", 0.5):
+                                        # current=4, demand=10: deficit=6, step=min(max(int(6*0.5),1),2)=2
+                                        # max=5 -> should go to 5, not 6
+                                        action, new_count = autoscaler.evaluate_scaling(
+                                            demand=10, current=4, state=state
+                                        )
 
         assert action == "up"
         assert new_count == 5  # Capped at MAX_INSTANCES
 
     def test_scale_down_by_larger_step(self):
-        """Should scale down by SCALE_DOWN_STEP when configured."""
+        """Should scale down proportionally up to SCALE_DOWN_STEP max."""
         state = self._create_state_with_breach_score("down", 2.5)
 
         with patch.object(autoscaler, "SCALE_UP_THRESHOLD", 1.5):
@@ -409,13 +415,14 @@ class TestEvaluateScaling:
                         with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
                             with patch.object(autoscaler, "MIN_INSTANCES", 1):
                                 with patch.object(autoscaler, "SCALE_DOWN_STEP", 2):
-                                    # current=5, step=2 -> should go to 3
-                                    action, new_count = autoscaler.evaluate_scaling(
-                                        demand=0, current=5, state=state
-                                    )
+                                    with patch.object(autoscaler, "SCALE_DOWN_PROPORTION", 0.5):
+                                        # current=5, demand=0: excess=5, step=min(max(int(5*0.5),1),2)=2
+                                        action, new_count = autoscaler.evaluate_scaling(
+                                            demand=0, current=5, state=state
+                                        )
 
         assert action == "down"
-        assert new_count == 3  # 5 - 2 = 3
+        assert new_count == 3  # 5 - 2 = 3 (capped at SCALE_DOWN_STEP)
 
     def test_scale_down_by_step_respects_min(self):
         """Should not scale below MIN_INSTANCES even with step > 1."""
@@ -428,10 +435,12 @@ class TestEvaluateScaling:
                         with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
                             with patch.object(autoscaler, "MIN_INSTANCES", 2):
                                 with patch.object(autoscaler, "SCALE_DOWN_STEP", 3):
-                                    # current=4, step=3, min=2 -> should go to 2, not 1
-                                    action, new_count = autoscaler.evaluate_scaling(
-                                        demand=0, current=4, state=state
-                                    )
+                                    with patch.object(autoscaler, "SCALE_DOWN_PROPORTION", 0.5):
+                                        # current=4, demand=0: excess=4, step=min(max(int(4*0.5),1),3)=2
+                                        # min=2 -> should go to 2, not below
+                                        action, new_count = autoscaler.evaluate_scaling(
+                                            demand=0, current=4, state=state
+                                        )
 
         assert action == "down"
         assert new_count == 2  # Capped at MIN_INSTANCES
@@ -805,8 +814,10 @@ class TestValidateConfig:
                                             with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
                                                 with patch.object(autoscaler, "DECAY_HALF_LIFE_SECONDS", 30):
                                                     with patch.object(autoscaler, "BREACH_THRESHOLD", 2.0):
-                                                        # Should not raise
-                                                        validate_config()
+                                                        with patch.object(autoscaler, "SCALE_UP_PROPORTION", 0.5):
+                                                            with patch.object(autoscaler, "SCALE_DOWN_PROPORTION", 0.5):
+                                                                # Should not raise
+                                                                validate_config()
 
     def test_validate_config_fails_min_greater_than_max(self):
         """Should exit when MIN_INSTANCES > MAX_INSTANCES."""
@@ -901,6 +912,65 @@ class TestValidateConfig:
                 with patch.object(autoscaler, "BREACH_THRESHOLD", 0):
                     with pytest.raises(SystemExit):
                         validate_config()
+
+    def test_validate_config_fails_zero_scale_up_proportion(self):
+        """Should exit when SCALE_UP_PROPORTION <= 0."""
+        with patch.object(autoscaler, "MIN_INSTANCES", 1):
+            with patch.object(autoscaler, "MAX_INSTANCES", 5):
+                with patch.object(autoscaler, "SCALE_UP_PROPORTION", 0):
+                    with pytest.raises(SystemExit):
+                        validate_config()
+
+    def test_validate_config_fails_negative_scale_up_proportion(self):
+        """Should exit when SCALE_UP_PROPORTION < 0."""
+        with patch.object(autoscaler, "MIN_INSTANCES", 1):
+            with patch.object(autoscaler, "MAX_INSTANCES", 5):
+                with patch.object(autoscaler, "SCALE_UP_PROPORTION", -0.5):
+                    with pytest.raises(SystemExit):
+                        validate_config()
+
+    def test_validate_config_fails_scale_up_proportion_greater_than_one(self):
+        """Should exit when SCALE_UP_PROPORTION > 1."""
+        with patch.object(autoscaler, "MIN_INSTANCES", 1):
+            with patch.object(autoscaler, "MAX_INSTANCES", 5):
+                with patch.object(autoscaler, "SCALE_UP_PROPORTION", 1.5):
+                    with pytest.raises(SystemExit):
+                        validate_config()
+
+    def test_validate_config_fails_zero_scale_down_proportion(self):
+        """Should exit when SCALE_DOWN_PROPORTION <= 0."""
+        with patch.object(autoscaler, "MIN_INSTANCES", 1):
+            with patch.object(autoscaler, "MAX_INSTANCES", 5):
+                with patch.object(autoscaler, "SCALE_DOWN_PROPORTION", 0):
+                    with pytest.raises(SystemExit):
+                        validate_config()
+
+    def test_validate_config_fails_scale_down_proportion_greater_than_one(self):
+        """Should exit when SCALE_DOWN_PROPORTION > 1."""
+        with patch.object(autoscaler, "MIN_INSTANCES", 1):
+            with patch.object(autoscaler, "MAX_INSTANCES", 5):
+                with patch.object(autoscaler, "SCALE_DOWN_PROPORTION", 1.1):
+                    with pytest.raises(SystemExit):
+                        validate_config()
+
+    def test_validate_config_passes_edge_proportion_values(self):
+        """Should pass with edge proportion values (exactly 1.0)."""
+        with patch.object(autoscaler, "MIN_INSTANCES", 1):
+            with patch.object(autoscaler, "MAX_INSTANCES", 5):
+                with patch.object(autoscaler, "SCALE_UP_COOLDOWN", 60):
+                    with patch.object(autoscaler, "SCALE_DOWN_COOLDOWN", 180):
+                        with patch.object(autoscaler, "POLL_INTERVAL", 60):
+                            with patch.object(autoscaler, "SCALE_UP_STEP", 2):
+                                with patch.object(autoscaler, "SCALE_DOWN_STEP", 1):
+                                    with patch.object(autoscaler, "SCALE_UP_THRESHOLD", 1.5):
+                                        with patch.object(autoscaler, "SCALE_DOWN_THRESHOLD", 0.25):
+                                            with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
+                                                with patch.object(autoscaler, "DECAY_HALF_LIFE_SECONDS", 30):
+                                                    with patch.object(autoscaler, "BREACH_THRESHOLD", 2.0):
+                                                        with patch.object(autoscaler, "SCALE_UP_PROPORTION", 1.0):
+                                                            with patch.object(autoscaler, "SCALE_DOWN_PROPORTION", 1.0):
+                                                                # Should not raise
+                                                                validate_config()
 
 
 if __name__ == "__main__":
