@@ -39,21 +39,21 @@ REPO = os.environ.get("REPO")
 WORKER_NAME = os.environ.get("WORKER_NAME", "runner")
 MIN_INSTANCES = int(os.environ.get("MIN_INSTANCES", "1"))
 MAX_INSTANCES = int(os.environ.get("MAX_INSTANCES", "5"))
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "60"))
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "30"))
 
 # Cooldown configuration (anti-thrashing)
 SCALE_UP_COOLDOWN = int(os.environ.get("SCALE_UP_COOLDOWN", "60"))  # seconds
 SCALE_DOWN_COOLDOWN = int(os.environ.get("SCALE_DOWN_COOLDOWN", "180"))  # seconds
 
 # Scale-up configuration
-SCALE_UP_STEP = int(os.environ.get("SCALE_UP_STEP", "2"))  # max instances to add at once
+SCALE_UP_STEP = int(os.environ.get("SCALE_UP_STEP", "3"))  # max instances to add at once
 SCALE_UP_PROPORTION = float(os.environ.get("SCALE_UP_PROPORTION", "0.5"))  # fraction of queued jobs
 
 # Runner filtering
 RUNNER_NAME_PREFIX = os.environ.get("RUNNER_NAME_PREFIX", "")
 
 # Multiple runners per instance
-RUNNERS_PER_INSTANCE = int(os.environ.get("RUNNERS_PER_INSTANCE", "1"))
+RUNNERS_PER_INSTANCE = int(os.environ.get("RUNNERS_PER_INSTANCE", "2"))
 
 GITHUB_API = "https://api.github.com"
 DO_API = "https://api.digitalocean.com/v2"

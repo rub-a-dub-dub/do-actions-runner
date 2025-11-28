@@ -107,13 +107,13 @@ This handles runners that crashed without deregistering.
 | `ORG` | for org | Organization name |
 | `WORKER_NAME` | `runner` | Name of worker component to scale |
 | `RUNNER_NAME_PREFIX` | `""` | Prefix to match runner names (empty = count all self-hosted) |
-| `RUNNERS_PER_INSTANCE` | `1` | Number of runner processes per container instance |
+| `RUNNERS_PER_INSTANCE` | `2` | Number of runner processes per container instance |
 | `MIN_INSTANCES` | `1` | Minimum instance count (DO App Platform requires >= 1) |
 | `MAX_INSTANCES` | `5` | Maximum instance count |
-| `POLL_INTERVAL` | `60` | Seconds between polls |
+| `POLL_INTERVAL` | `30` | Seconds between polls |
 | `SCALE_UP_COOLDOWN` | `60` | Seconds to wait after scale-up |
 | `SCALE_DOWN_COOLDOWN` | `180` | Seconds to wait after scale-down |
-| `SCALE_UP_STEP` | `2` | Maximum instances to add when scaling up |
+| `SCALE_UP_STEP` | `3` | Maximum instances to add when scaling up |
 | `SCALE_UP_PROPORTION` | `0.5` | Fraction of queue to scale up by |
 
 ## Scaling Behavior Examples
