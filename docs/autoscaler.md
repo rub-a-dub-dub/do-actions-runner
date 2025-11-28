@@ -1,13 +1,13 @@
 # Autoscaler
 
-The autoscaler automatically adjusts the number of runner instances based on GitHub Actions job queue depth.
+The autoscaler automatically adjusts the number of runner instances based on GitHub Actions job demand (queued + in_progress jobs).
 
 ## Algorithm Overview
 
 ```
                     ┌─────────────────────┐
                     │   Poll GitHub API   │
-                    │  (queued job count) │
+                    │  (job demand count) │
                     └──────────┬──────────┘
                                │
                     ┌──────────▼──────────┐
@@ -18,7 +18,7 @@ The autoscaler automatically adjusts the number of runner instances based on Git
                ┌───────────────┼───────────────┐
                │               │               │
      ┌─────────▼─────────┐     │     ┌─────────▼─────────┐
-     │  queued > current │     │     │  queued < current │
+     │  demand > current │     │     │  demand < current │
      │  × SCALE_UP_THRES │     │     │  × SCALE_DOWN_THRES
      └─────────┬─────────┘     │     └─────────┬─────────┘
                │               │               │
@@ -38,19 +38,21 @@ The autoscaler automatically adjusts the number of runner instances based on Git
                     └─────────────────────┘
 ```
 
+**Job Demand** = queued jobs + in_progress jobs. This prevents scaling down while jobs are still running.
+
 ## Anti-Thrashing Mechanisms
 
 ### 1. Hysteresis Thresholds
 
 Scale-up and scale-down use different thresholds to create a dead zone:
 
-- **Scale-up**: `queued_jobs > current_instances × SCALE_UP_THRESHOLD`
-- **Scale-down**: `queued_jobs < current_instances × SCALE_DOWN_THRESHOLD`
+- **Scale-up**: `job_demand > current_instances × SCALE_UP_THRESHOLD`
+- **Scale-down**: `job_demand < current_instances × SCALE_DOWN_THRESHOLD`
 
 Example with defaults (1.5x up, 0.25x down):
-- 2 instances, 4 queued jobs → scale up (4 > 3.0)
-- 2 instances, 1 queued job → stable (1 is not > 3.0 and not < 0.5)
-- 2 instances, 0 queued jobs → scale down (0 < 0.5)
+- 2 instances, 4 job demand → scale up (4 > 3.0)
+- 2 instances, 1 job demand → stable (1 is not > 3.0 and not < 0.5)
+- 2 instances, 0 job demand → scale down (0 < 0.5)
 
 ### 2. Time-Decay Stabilization
 
@@ -112,7 +114,7 @@ This handles runners that crashed without deregistering.
 | `REPO` | for repo | Repository name |
 | `ORG` | for org | Organization name |
 | `WORKER_NAME` | `runner` | Name of worker component to scale |
-| `MIN_INSTANCES` | `1` | Minimum instance count |
+| `MIN_INSTANCES` | `1` | Minimum instance count (DO App Platform requires >= 1) |
 | `MAX_INSTANCES` | `5` | Maximum instance count |
 | `POLL_INTERVAL` | `60` | Seconds between polls |
 | `SCALE_UP_THRESHOLD` | `1.5` | Multiplier for scale-up trigger |

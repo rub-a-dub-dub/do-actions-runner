@@ -123,24 +123,24 @@ class TestThresholds:
     """Tests for threshold functions."""
 
     def test_should_scale_up_when_above_threshold(self):
-        """Should return True when queued exceeds threshold."""
+        """Should return True when demand exceeds threshold."""
         with patch.object(autoscaler, "SCALE_UP_THRESHOLD", 1.5):
             # 2 instances * 1.5 = 3.0 threshold, 4 > 3.0
-            assert autoscaler.should_scale_up(queued=4, current=2) is True
+            assert autoscaler.should_scale_up(demand=4, current=2) is True
             # 2 instances * 1.5 = 3.0 threshold, 3 == 3.0 (not greater)
-            assert autoscaler.should_scale_up(queued=3, current=2) is False
+            assert autoscaler.should_scale_up(demand=3, current=2) is False
             # 2 instances * 1.5 = 3.0 threshold, 2 < 3.0
-            assert autoscaler.should_scale_up(queued=2, current=2) is False
+            assert autoscaler.should_scale_up(demand=2, current=2) is False
 
     def test_should_scale_down_when_below_threshold(self):
-        """Should return True when queued is below threshold."""
+        """Should return True when demand is below threshold."""
         with patch.object(autoscaler, "SCALE_DOWN_THRESHOLD", 0.25):
             # 4 instances * 0.25 = 1.0 threshold, 0 < 1.0
-            assert autoscaler.should_scale_down(queued=0, current=4) is True
+            assert autoscaler.should_scale_down(demand=0, current=4) is True
             # 4 instances * 0.25 = 1.0 threshold, 1 == 1.0 (not less)
-            assert autoscaler.should_scale_down(queued=1, current=4) is False
+            assert autoscaler.should_scale_down(demand=1, current=4) is False
             # 4 instances * 0.25 = 1.0 threshold, 2 > 1.0
-            assert autoscaler.should_scale_down(queued=2, current=4) is False
+            assert autoscaler.should_scale_down(demand=2, current=4) is False
 
 
 class TestCooldown:
@@ -227,9 +227,9 @@ class TestEvaluateScaling:
                         with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
                             with patch.object(autoscaler, "MAX_INSTANCES", 5):
                                 with patch.object(autoscaler, "SCALE_UP_STEP", 2):
-                                    # queued=4, current=2: 4 > 2*1.5=3.0, should trigger scale-up
+                                    # demand=4, current=2: 4 > 2*1.5=3.0, should trigger scale-up
                                     action, new_count = autoscaler.evaluate_scaling(
-                                        queued=4, current=2, state=state
+                                        demand=4, current=2, state=state
                                     )
 
         assert action == "up"
@@ -246,7 +246,7 @@ class TestEvaluateScaling:
                         with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
                             with patch.object(autoscaler, "MAX_INSTANCES", 5):
                                 action, new_count = autoscaler.evaluate_scaling(
-                                    queued=4, current=2, state=state
+                                    demand=4, current=2, state=state
                                 )
 
         assert action == "none"
@@ -268,7 +268,7 @@ class TestEvaluateScaling:
                             with patch.object(autoscaler, "SCALE_UP_COOLDOWN", 60):
                                 with patch.object(autoscaler, "MAX_INSTANCES", 5):
                                     action, new_count = autoscaler.evaluate_scaling(
-                                        queued=4, current=2, state=state
+                                        demand=4, current=2, state=state
                                     )
 
         assert action == "none"
@@ -285,9 +285,9 @@ class TestEvaluateScaling:
                         with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
                             with patch.object(autoscaler, "MIN_INSTANCES", 1):
                                 with patch.object(autoscaler, "SCALE_DOWN_STEP", 1):
-                                    # queued=0, current=4: 0 < 4*0.25=1.0, should trigger scale-down
+                                    # demand=0, current=4: 0 < 4*0.25=1.0, should trigger scale-down
                                     action, new_count = autoscaler.evaluate_scaling(
-                                        queued=0, current=4, state=state
+                                        demand=0, current=4, state=state
                                     )
 
         assert action == "down"
@@ -306,14 +306,14 @@ class TestEvaluateScaling:
                             with patch.object(autoscaler, "SCALE_DOWN_COOLDOWN", 180):
                                 with patch.object(autoscaler, "MIN_INSTANCES", 1):
                                     action, new_count = autoscaler.evaluate_scaling(
-                                        queued=0, current=4, state=state
+                                        demand=0, current=4, state=state
                                     )
 
         assert action == "none"
         assert new_count == 4
 
     def test_no_scaling_when_stable(self):
-        """Should not scale when queue is within thresholds."""
+        """Should not scale when demand is within thresholds."""
         state = ScalingState()
 
         with patch.object(autoscaler, "SCALE_UP_THRESHOLD", 1.5):
@@ -321,9 +321,9 @@ class TestEvaluateScaling:
                 with patch.object(autoscaler, "BREACH_THRESHOLD", 2.0):
                     with patch.object(autoscaler, "DECAY_HALF_LIFE_SECONDS", 30):
                         with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
-                            # queued=1, current=2: 1 < 3.0 (no scale-up), 1 > 0.5 (no scale-down)
+                            # demand=1, current=2: 1 < 3.0 (no scale-up), 1 > 0.5 (no scale-down)
                             action, new_count = autoscaler.evaluate_scaling(
-                                queued=1, current=2, state=state
+                                demand=1, current=2, state=state
                             )
 
         assert action == "none"
@@ -342,7 +342,7 @@ class TestEvaluateScaling:
                         with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
                             with patch.object(autoscaler, "MAX_INSTANCES", 5):
                                 action, new_count = autoscaler.evaluate_scaling(
-                                    queued=10, current=5, state=state
+                                    demand=10, current=5, state=state
                                 )
 
         assert action == "none"
@@ -359,7 +359,7 @@ class TestEvaluateScaling:
                         with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
                             with patch.object(autoscaler, "MIN_INSTANCES", 1):
                                 action, new_count = autoscaler.evaluate_scaling(
-                                    queued=0, current=1, state=state
+                                    demand=0, current=1, state=state
                                 )
 
         assert action == "none"
@@ -374,7 +374,7 @@ class TestEvaluateScaling:
                 with patch.object(autoscaler, "BREACH_THRESHOLD", 2.0):
                     with patch.object(autoscaler, "DECAY_HALF_LIFE_SECONDS", 30):
                         with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
-                            autoscaler.evaluate_scaling(queued=4, current=2, state=state)
+                            autoscaler.evaluate_scaling(demand=4, current=2, state=state)
 
         assert len(state.breach_history) == 1
         assert state.breach_history[0][1] == "up"
@@ -392,7 +392,7 @@ class TestEvaluateScaling:
                                 with patch.object(autoscaler, "SCALE_UP_STEP", 2):
                                     # current=4, step=2, max=5 -> should go to 5, not 6
                                     action, new_count = autoscaler.evaluate_scaling(
-                                        queued=10, current=4, state=state
+                                        demand=10, current=4, state=state
                                     )
 
         assert action == "up"
@@ -411,7 +411,7 @@ class TestEvaluateScaling:
                                 with patch.object(autoscaler, "SCALE_DOWN_STEP", 2):
                                     # current=5, step=2 -> should go to 3
                                     action, new_count = autoscaler.evaluate_scaling(
-                                        queued=0, current=5, state=state
+                                        demand=0, current=5, state=state
                                     )
 
         assert action == "down"
@@ -430,19 +430,19 @@ class TestEvaluateScaling:
                                 with patch.object(autoscaler, "SCALE_DOWN_STEP", 3):
                                     # current=4, step=3, min=2 -> should go to 2, not 1
                                     action, new_count = autoscaler.evaluate_scaling(
-                                        queued=0, current=4, state=state
+                                        demand=0, current=4, state=state
                                     )
 
         assert action == "down"
         assert new_count == 2  # Capped at MIN_INSTANCES
 
 
-class TestGetQueuedJobs:
-    """Tests for get_queued_jobs function."""
+class TestGetJobDemand:
+    """Tests for get_job_demand function."""
 
     @patch("autoscaler.requests.get")
-    def test_counts_queued_jobs_not_runs(self, mock_get):
-        """Should count actual queued jobs, not workflow runs."""
+    def test_counts_queued_and_in_progress_jobs(self, mock_get):
+        """Should count both queued and in_progress jobs (total demand)."""
         # Mock responses for runs (queued), runs (in_progress), and jobs
         def mock_get_side_effect(url, headers=None):
             mock_resp = MagicMock()
@@ -481,10 +481,10 @@ class TestGetQueuedJobs:
         with patch.object(autoscaler, "ORG", None):
             with patch.object(autoscaler, "OWNER", "test-owner"):
                 with patch.object(autoscaler, "REPO", "test-repo"):
-                    result = autoscaler.get_queued_jobs()
+                    result = autoscaler.get_job_demand()
 
-        # 2 queued from run 123 + 1 queued from run 456 = 3
-        assert result == 3
+        # 2 queued from run 123 + 1 queued from run 456 + 1 in_progress from run 456 = 4
+        assert result == 4
 
     @patch("autoscaler.requests.get")
     def test_org_level_api_call(self, mock_get):
@@ -511,7 +511,7 @@ class TestGetQueuedJobs:
         mock_get.side_effect = mock_get_side_effect
 
         with patch.object(autoscaler, "ORG", "test-org"):
-            result = autoscaler.get_queued_jobs()
+            result = autoscaler.get_job_demand()
 
         assert result == 1
         # Verify org-level runs API was called
