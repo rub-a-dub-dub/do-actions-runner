@@ -53,6 +53,21 @@ spec:
     - key: POLL_INTERVAL
       scope: RUN_TIME
       value: "60"
+    - key: SCALE_UP_COOLDOWN
+      scope: RUN_TIME
+      value: "60"
+    - key: SCALE_DOWN_COOLDOWN
+      scope: RUN_TIME
+      value: "180"
+    - key: SCALE_UP_THRESHOLD
+      scope: RUN_TIME
+      value: "1.5"
+    - key: SCALE_DOWN_THRESHOLD
+      scope: RUN_TIME
+      value: "0.25"
+    - key: STABILIZATION_WINDOW
+      scope: RUN_TIME
+      value: "3"
     git:
       branch: main
       repo_clone_url: https://github.com/rub-a-dub-dub/do-actions-runner.git

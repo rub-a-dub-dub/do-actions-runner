@@ -3,11 +3,14 @@
 GitHub Actions Runner Autoscaler for DigitalOcean App Platform.
 
 Polls GitHub API for queued jobs and scales runner workers accordingly.
+Includes cooldown periods, hysteresis thresholds, and stabilization windows
+to prevent thrashing.
 """
 
 import os
 import sys
 import time
+from dataclasses import dataclass, field
 
 import requests
 
@@ -25,11 +28,31 @@ REPO = os.environ.get("REPO")
 WORKER_NAME = os.environ.get("WORKER_NAME", "runner")
 MIN_INSTANCES = int(os.environ.get("MIN_INSTANCES", "1"))
 MAX_INSTANCES = int(os.environ.get("MAX_INSTANCES", "5"))
-JOBS_PER_RUNNER = int(os.environ.get("JOBS_PER_RUNNER", "1"))
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "60"))
+
+# Cooldown configuration (anti-thrashing)
+SCALE_UP_COOLDOWN = int(os.environ.get("SCALE_UP_COOLDOWN", "60"))  # seconds
+SCALE_DOWN_COOLDOWN = int(os.environ.get("SCALE_DOWN_COOLDOWN", "180"))  # seconds
+
+# Hysteresis thresholds
+SCALE_UP_THRESHOLD = float(os.environ.get("SCALE_UP_THRESHOLD", "1.5"))
+SCALE_DOWN_THRESHOLD = float(os.environ.get("SCALE_DOWN_THRESHOLD", "0.25"))
+
+# Stabilization window (consecutive readings required)
+STABILIZATION_WINDOW = int(os.environ.get("STABILIZATION_WINDOW", "3"))
 
 GITHUB_API = "https://api.github.com"
 DO_API = "https://api.digitalocean.com/v2"
+
+
+@dataclass
+class ScalingState:
+    """Tracks scaling state for cooldown and stabilization."""
+
+    last_scale_time: float = 0
+    last_scale_direction: str = ""  # "up" or "down"
+    consecutive_scale_up_readings: int = 0
+    consecutive_scale_down_readings: int = 0
 
 
 def get_queued_jobs() -> int:
@@ -112,10 +135,89 @@ def scale_worker(desired_count: int) -> None:
     print(f"Scaled {WORKER_NAME} to {desired_count} instances")
 
 
-def calculate_desired_instances(queued_jobs: int) -> int:
-    """Calculate desired instance count based on queue depth."""
-    desired = max(MIN_INSTANCES, (queued_jobs + JOBS_PER_RUNNER - 1) // JOBS_PER_RUNNER)
-    return min(desired, MAX_INSTANCES)
+def should_scale_up(queued: int, current: int) -> bool:
+    """Check if scale-up threshold is met."""
+    threshold = current * SCALE_UP_THRESHOLD
+    return queued > threshold
+
+
+def should_scale_down(queued: int, current: int) -> bool:
+    """Check if scale-down threshold is met."""
+    threshold = current * SCALE_DOWN_THRESHOLD
+    return queued < threshold
+
+
+def is_cooldown_active(state: ScalingState, direction: str) -> bool:
+    """Check if cooldown period is still active for the given direction."""
+    if state.last_scale_time == 0:
+        return False
+
+    elapsed = time.time() - state.last_scale_time
+
+    if direction == "up":
+        return elapsed < SCALE_UP_COOLDOWN
+    else:  # down
+        return elapsed < SCALE_DOWN_COOLDOWN
+
+
+def evaluate_scaling(
+    queued: int, current: int, state: ScalingState
+) -> tuple[str, int]:
+    """
+    Evaluate scaling decision based on thresholds, stabilization, and cooldown.
+
+    Returns:
+        tuple of (action, new_count) where action is "up", "down", or "none"
+    """
+    # Check scale-up condition
+    if should_scale_up(queued, current):
+        state.consecutive_scale_up_readings += 1
+        state.consecutive_scale_down_readings = 0
+        print(
+            f"Scale-up condition met ({queued} > {current * SCALE_UP_THRESHOLD:.1f}), "
+            f"readings: {state.consecutive_scale_up_readings}/{STABILIZATION_WINDOW}"
+        )
+
+        if state.consecutive_scale_up_readings >= STABILIZATION_WINDOW:
+            if is_cooldown_active(state, "up"):
+                remaining = SCALE_UP_COOLDOWN - (time.time() - state.last_scale_time)
+                print(f"Scale-up blocked by cooldown ({remaining:.0f}s remaining)")
+                return ("none", current)
+
+            new_count = min(current + 1, MAX_INSTANCES)
+            if new_count > current:
+                return ("up", new_count)
+            else:
+                print(f"Already at MAX_INSTANCES ({MAX_INSTANCES})")
+
+    # Check scale-down condition
+    elif should_scale_down(queued, current):
+        state.consecutive_scale_down_readings += 1
+        state.consecutive_scale_up_readings = 0
+        print(
+            f"Scale-down condition met ({queued} < {current * SCALE_DOWN_THRESHOLD:.1f}), "
+            f"readings: {state.consecutive_scale_down_readings}/{STABILIZATION_WINDOW}"
+        )
+
+        if state.consecutive_scale_down_readings >= STABILIZATION_WINDOW:
+            if is_cooldown_active(state, "down"):
+                remaining = SCALE_DOWN_COOLDOWN - (time.time() - state.last_scale_time)
+                print(f"Scale-down blocked by cooldown ({remaining:.0f}s remaining)")
+                return ("none", current)
+
+            new_count = max(current - 1, MIN_INSTANCES)
+            if new_count < current:
+                return ("down", new_count)
+            else:
+                print(f"Already at MIN_INSTANCES ({MIN_INSTANCES})")
+
+    # No scaling condition met - reset counters
+    else:
+        state.consecutive_scale_up_readings = 0
+        state.consecutive_scale_down_readings = 0
+        print(f"Queue stable (no scaling thresholds met)")
+
+    return ("none", current)
 
 
 def main():
@@ -125,22 +227,35 @@ def main():
     print(f"  Min instances: {MIN_INSTANCES}")
     print(f"  Max instances: {MAX_INSTANCES}")
     print(f"  Poll interval: {POLL_INTERVAL}s")
+    print(f"  Scale-up threshold: {SCALE_UP_THRESHOLD}x capacity")
+    print(f"  Scale-down threshold: {SCALE_DOWN_THRESHOLD}x capacity")
+    print(f"  Scale-up cooldown: {SCALE_UP_COOLDOWN}s")
+    print(f"  Scale-down cooldown: {SCALE_DOWN_COOLDOWN}s")
+    print(f"  Stabilization window: {STABILIZATION_WINDOW} readings")
 
     if not all([GITHUB_TOKEN, DO_API_TOKEN, APP_ID]):
         print("ERROR: GITHUB_TOKEN, DO_API_TOKEN, and APP_ID are required")
         sys.exit(1)
 
+    state = ScalingState()
+
     while True:
         try:
             queued = get_queued_jobs()
             current = get_current_instance_count()
-            desired = calculate_desired_instances(queued)
 
-            if desired != current:
-                print(f"Scaling {WORKER_NAME}: {current} -> {desired}")
-                scale_worker(desired)
+            action, new_count = evaluate_scaling(queued, current, state)
+
+            if action != "none":
+                print(f"Scaling {WORKER_NAME}: {current} -> {new_count}")
+                scale_worker(new_count)
+                state.last_scale_time = time.time()
+                state.last_scale_direction = action
+                # Reset counters after scaling
+                state.consecutive_scale_up_readings = 0
+                state.consecutive_scale_down_readings = 0
             else:
-                print(f"No scaling needed ({current} instances)")
+                print(f"No scaling action ({current} instances)")
 
         except requests.RequestException as e:
             print(f"API error: {e}")
