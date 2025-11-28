@@ -119,8 +119,11 @@ class ScalingState:
 def get_queued_job_count() -> int:
     """Get count of queued jobs targeting self-hosted runners.
 
-    Only counts queued jobs (not in_progress). Ephemeral runners handle
-    in_progress jobs themselves - they exit after completion.
+    Queries both 'queued' and 'in_progress' runs because a run can be
+    in_progress (some jobs running) while other jobs are still queued.
+
+    Only counts jobs with status='queued', not in_progress jobs.
+    Ephemeral runners handle in_progress jobs - they exit after completion.
 
     Returns:
         Number of queued jobs waiting for runners.
@@ -130,25 +133,39 @@ def get_queued_job_count() -> int:
         "Accept": "application/vnd.github.v3+json",
     }
 
-    # Get runs that are queued (jobs may be waiting for runners)
-    if ORG:
-        runs_url = f"{GITHUB_API}/orgs/{ORG}/actions/runs?status=queued&per_page=100"
-    elif OWNER and REPO:
-        runs_url = f"{GITHUB_API}/repos/{OWNER}/{REPO}/actions/runs?status=queued&per_page=100"
-    else:
+    if not ORG and not (OWNER and REPO):
         log.error("ORG or (OWNER and REPO) must be set")
         sys.exit(1)
 
-    resp = requests.get(runs_url, headers=headers)
-    resp.raise_for_status()
-    queued_runs = resp.json().get("workflow_runs", [])
+    # Query both queued AND in_progress runs
+    # A run can be in_progress while having queued jobs waiting for runners
+    all_runs = []
+    for run_status in ["queued", "in_progress"]:
+        if ORG:
+            runs_url = f"{GITHUB_API}/orgs/{ORG}/actions/runs?status={run_status}&per_page=100"
+        else:
+            runs_url = f"{GITHUB_API}/repos/{OWNER}/{REPO}/actions/runs?status={run_status}&per_page=100"
+
+        try:
+            resp = requests.get(runs_url, headers=headers)
+            resp.raise_for_status()
+            all_runs.extend(resp.json().get("workflow_runs", []))
+        except requests.RequestException as e:
+            log.warning(f"Failed to get {run_status} runs: {e}")
+
+    # Deduplicate runs by ID (in case a run appears in both queries during transition)
+    seen_run_ids = set()
+    unique_runs = []
+    for run in all_runs:
+        run_id = run.get("id")
+        if run_id and run_id not in seen_run_ids:
+            seen_run_ids.add(run_id)
+            unique_runs.append(run)
 
     # Count queued jobs across all runs
     queued_count = 0
-    for run in queued_runs:
+    for run in unique_runs:
         run_id = run.get("id")
-        if not run_id:
-            continue
 
         # Get jobs for this run
         if ORG:
@@ -472,7 +489,7 @@ def cleanup_dead_runners() -> int:
     return deleted
 
 
-AUTOSCALER_VERSION = "2.0.0"  # Ephemeral runner algorithm
+AUTOSCALER_VERSION = "2.0.1"  # Fix: query in_progress runs for queued jobs
 
 
 def main():

@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 # Invalidate cache with real build layer change
-ENV AUTOSCALER_VERSION=2.0.0
+ENV AUTOSCALER_VERSION=2.0.1
 
 WORKDIR /app
 
