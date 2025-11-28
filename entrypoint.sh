@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -eEuo pipefail
 
+# Increase file descriptor limit for actions that extract many files
+ulimit -n 65536 2>/dev/null || ulimit -n 32768 2>/dev/null || ulimit -n 16384 2>/dev/null || true
+
 if [ -z "${TOKEN:-}" ]
 then
   echo "TOKEN is required"
