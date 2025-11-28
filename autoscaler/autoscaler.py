@@ -213,8 +213,8 @@ def get_job_demand() -> int:
                     if is_self_hosted_job(job):
                         queued_count += 1
                 elif status == "in_progress":
-                    # Count in_progress jobs only if on our runners
-                    if is_our_runner(runner_name):
+                    # Count in_progress jobs only if targeting self-hosted AND on our runners
+                    if is_self_hosted_job(job) and is_our_runner(runner_name):
                         in_progress_count += 1
         except requests.RequestException as e:
             log.warning(f"Failed to get jobs for run {run_id}: {e}")
