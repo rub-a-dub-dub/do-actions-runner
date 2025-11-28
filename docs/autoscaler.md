@@ -40,6 +40,8 @@ The autoscaler automatically adjusts the number of runner instances based on Git
 
 **Job Demand** = filtered queued jobs + filtered in_progress jobs. This prevents scaling down while jobs are still running.
 
+**Runner Capacity** = current_instances × RUNNERS_PER_INSTANCE. When running multiple runners per container, scaling decisions compare job demand against total runner capacity rather than instance count.
+
 ### Job Filtering
 
 Not all jobs in your org/repo are relevant to this runner group. The autoscaler filters jobs:
@@ -55,13 +57,17 @@ This prevents the autoscaler from scaling based on GitHub-hosted runner jobs or 
 
 Scale-up and scale-down use different thresholds to create a dead zone:
 
-- **Scale-up**: `job_demand > current_instances × SCALE_UP_THRESHOLD`
-- **Scale-down**: `job_demand < current_instances × SCALE_DOWN_THRESHOLD`
+- **Scale-up**: `job_demand > runner_capacity × SCALE_UP_THRESHOLD`
+- **Scale-down**: `job_demand < runner_capacity × SCALE_DOWN_THRESHOLD`
 
-Example with defaults (1.5x up, 0.25x down):
-- 2 instances, 4 job demand → scale up (4 > 3.0)
-- 2 instances, 1 job demand → stable (1 is not > 3.0 and not < 0.5)
-- 2 instances, 0 job demand → scale down (0 < 0.5)
+Example with defaults (1.5x up, 0.25x down, 1 runner per instance):
+- 2 instances (capacity=2), 4 job demand → scale up (4 > 3.0)
+- 2 instances (capacity=2), 1 job demand → stable (1 is not > 3.0 and not < 0.5)
+- 2 instances (capacity=2), 0 job demand → scale down (0 < 0.5)
+
+Example with `RUNNERS_PER_INSTANCE=2`:
+- 2 instances (capacity=4), 5 job demand → stable (5 is not > 6.0 and not < 1.0)
+- 2 instances (capacity=4), 8 job demand → scale up (8 > 6.0)
 
 ### 2. Time-Decay Stabilization
 
@@ -86,20 +92,22 @@ Scaling triggers when `breach_score >= BREACH_THRESHOLD`.
 
 ### 3. Proportional Scaling with Step Maximums
 
-Scaling is proportional to the demand gap, with configurable maximum step sizes:
+Scaling is proportional to the demand gap, with configurable maximum step sizes. When `RUNNERS_PER_INSTANCE > 1`, the deficit/excess is calculated against runner capacity, then converted to instances:
 
 **Scale-up formula:**
 ```
-deficit = demand - current_instances
-step = min(max(int(deficit × SCALE_UP_PROPORTION), 1), SCALE_UP_STEP)
-new_count = min(current + step, MAX_INSTANCES)
+runner_capacity = current_instances × RUNNERS_PER_INSTANCE
+runner_deficit = demand - runner_capacity
+instance_step = min(max(int((runner_deficit × SCALE_UP_PROPORTION) / RUNNERS_PER_INSTANCE + 0.5), 1), SCALE_UP_STEP)
+new_count = min(current + instance_step, MAX_INSTANCES)
 ```
 
 **Scale-down formula:**
 ```
-excess = current_instances - demand
-step = min(max(int(excess × SCALE_DOWN_PROPORTION), 1), SCALE_DOWN_STEP)
-new_count = max(current - step, MIN_INSTANCES)
+runner_capacity = current_instances × RUNNERS_PER_INSTANCE
+excess_capacity = runner_capacity - demand
+instance_step = min(max(int((excess_capacity × SCALE_DOWN_PROPORTION) / RUNNERS_PER_INSTANCE + 0.5), 1), SCALE_DOWN_STEP)
+new_count = max(current - instance_step, MIN_INSTANCES)
 ```
 
 This approach:
@@ -139,6 +147,7 @@ This handles runners that crashed without deregistering.
 | `ORG` | for org | Organization name |
 | `WORKER_NAME` | `runner` | Name of worker component to scale |
 | `RUNNER_NAME_PREFIX` | `""` | Prefix to match runner names (empty = count all self-hosted) |
+| `RUNNERS_PER_INSTANCE` | `1` | Number of runner processes per container instance |
 | `MIN_INSTANCES` | `1` | Minimum instance count (DO App Platform requires >= 1) |
 | `MAX_INSTANCES` | `5` | Maximum instance count |
 | `POLL_INTERVAL` | `60` | Seconds between polls |

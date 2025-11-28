@@ -177,22 +177,22 @@ class TestThresholds:
     def test_should_scale_up_when_above_threshold(self):
         """Should return True when demand exceeds threshold."""
         with patch.object(autoscaler, "SCALE_UP_THRESHOLD", 1.5):
-            # 2 instances * 1.5 = 3.0 threshold, 4 > 3.0
-            assert autoscaler.should_scale_up(demand=4, current=2) is True
-            # 2 instances * 1.5 = 3.0 threshold, 3 == 3.0 (not greater)
-            assert autoscaler.should_scale_up(demand=3, current=2) is False
-            # 2 instances * 1.5 = 3.0 threshold, 2 < 3.0
-            assert autoscaler.should_scale_up(demand=2, current=2) is False
+            # 2 capacity * 1.5 = 3.0 threshold, 4 > 3.0
+            assert autoscaler.should_scale_up(demand=4, capacity=2) is True
+            # 2 capacity * 1.5 = 3.0 threshold, 3 == 3.0 (not greater)
+            assert autoscaler.should_scale_up(demand=3, capacity=2) is False
+            # 2 capacity * 1.5 = 3.0 threshold, 2 < 3.0
+            assert autoscaler.should_scale_up(demand=2, capacity=2) is False
 
     def test_should_scale_down_when_below_threshold(self):
         """Should return True when demand is below threshold."""
         with patch.object(autoscaler, "SCALE_DOWN_THRESHOLD", 0.25):
-            # 4 instances * 0.25 = 1.0 threshold, 0 < 1.0
-            assert autoscaler.should_scale_down(demand=0, current=4) is True
-            # 4 instances * 0.25 = 1.0 threshold, 1 == 1.0 (not less)
-            assert autoscaler.should_scale_down(demand=1, current=4) is False
-            # 4 instances * 0.25 = 1.0 threshold, 2 > 1.0
-            assert autoscaler.should_scale_down(demand=2, current=4) is False
+            # 4 capacity * 0.25 = 1.0 threshold, 0 < 1.0
+            assert autoscaler.should_scale_down(demand=0, capacity=4) is True
+            # 4 capacity * 0.25 = 1.0 threshold, 1 == 1.0 (not less)
+            assert autoscaler.should_scale_down(demand=1, capacity=4) is False
+            # 4 capacity * 0.25 = 1.0 threshold, 2 > 1.0
+            assert autoscaler.should_scale_down(demand=2, capacity=4) is False
 
 
 class TestCooldown:
@@ -1060,6 +1060,97 @@ class TestValidateConfig:
                                                             with patch.object(autoscaler, "SCALE_DOWN_PROPORTION", 1.0):
                                                                 # Should not raise
                                                                 validate_config()
+
+    def test_validate_config_fails_zero_runners_per_instance(self):
+        """Should exit when RUNNERS_PER_INSTANCE < 1."""
+        with patch.object(autoscaler, "MIN_INSTANCES", 1):
+            with patch.object(autoscaler, "MAX_INSTANCES", 5):
+                with patch.object(autoscaler, "RUNNERS_PER_INSTANCE", 0):
+                    with pytest.raises(SystemExit):
+                        validate_config()
+
+
+class TestRunnersPerInstance:
+    """Tests for RUNNERS_PER_INSTANCE capacity calculations."""
+
+    def _create_state_with_breach_score(self, direction: str, score: float) -> ScalingState:
+        """Helper to create a state with pre-populated breach history achieving target score."""
+        state = ScalingState()
+        now = time.time()
+        for i in range(int(score + 1)):
+            state.breach_history.append((now - i * 0.1, direction))
+        return state
+
+    def test_capacity_multiplied_by_runners_per_instance(self):
+        """Should calculate capacity as instances × RUNNERS_PER_INSTANCE."""
+        state = self._create_state_with_breach_score("up", 2.5)
+
+        with patch.object(autoscaler, "SCALE_UP_THRESHOLD", 1.5):
+            with patch.object(autoscaler, "SCALE_DOWN_THRESHOLD", 0.25):
+                with patch.object(autoscaler, "BREACH_THRESHOLD", 2.0):
+                    with patch.object(autoscaler, "DECAY_HALF_LIFE_SECONDS", 30):
+                        with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
+                            with patch.object(autoscaler, "MAX_INSTANCES", 10):
+                                with patch.object(autoscaler, "RUNNERS_PER_INSTANCE", 2):
+                                    # With 2 instances and 2 runners/instance = 4 capacity
+                                    # Threshold = 4 * 1.5 = 6
+                                    # demand=5 < 6, so no scale up
+                                    action, new_count = autoscaler.evaluate_scaling(
+                                        demand=5, current=2, state=state
+                                    )
+
+        assert action == "none"
+        assert new_count == 2
+
+    def test_scale_up_with_multiple_runners_per_instance(self):
+        """Should scale up when demand exceeds capacity threshold."""
+        state = self._create_state_with_breach_score("up", 2.5)
+
+        with patch.object(autoscaler, "SCALE_UP_THRESHOLD", 1.5):
+            with patch.object(autoscaler, "SCALE_DOWN_THRESHOLD", 0.25):
+                with patch.object(autoscaler, "BREACH_THRESHOLD", 2.0):
+                    with patch.object(autoscaler, "DECAY_HALF_LIFE_SECONDS", 30):
+                        with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
+                            with patch.object(autoscaler, "MAX_INSTANCES", 10):
+                                with patch.object(autoscaler, "SCALE_UP_STEP", 2):
+                                    with patch.object(autoscaler, "SCALE_UP_PROPORTION", 0.5):
+                                        with patch.object(autoscaler, "RUNNERS_PER_INSTANCE", 2):
+                                            # 2 instances × 2 runners = 4 capacity
+                                            # Threshold = 4 × 1.5 = 6
+                                            # demand=8 > 6, triggers scale up
+                                            # runner_deficit = 8 - 4 = 4
+                                            # instance_step = min(max(int(4 * 0.5 / 2 + 0.5), 1), 2) = 1
+                                            action, new_count = autoscaler.evaluate_scaling(
+                                                demand=8, current=2, state=state
+                                            )
+
+        assert action == "up"
+        assert new_count == 3  # 2 + 1
+
+    def test_scale_down_with_multiple_runners_per_instance(self):
+        """Should scale down when demand is far below capacity threshold."""
+        state = self._create_state_with_breach_score("down", 2.5)
+
+        with patch.object(autoscaler, "SCALE_UP_THRESHOLD", 1.5):
+            with patch.object(autoscaler, "SCALE_DOWN_THRESHOLD", 0.25):
+                with patch.object(autoscaler, "BREACH_THRESHOLD", 2.0):
+                    with patch.object(autoscaler, "DECAY_HALF_LIFE_SECONDS", 30):
+                        with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
+                            with patch.object(autoscaler, "MIN_INSTANCES", 1):
+                                with patch.object(autoscaler, "SCALE_DOWN_STEP", 2):
+                                    with patch.object(autoscaler, "SCALE_DOWN_PROPORTION", 0.5):
+                                        with patch.object(autoscaler, "RUNNERS_PER_INSTANCE", 2):
+                                            # 4 instances × 2 runners = 8 capacity
+                                            # Threshold = 8 × 0.25 = 2
+                                            # demand=0 < 2, triggers scale down
+                                            # excess_capacity = 8 - 0 = 8
+                                            # instance_step = min(max(int(8 * 0.5 / 2 + 0.5), 1), 2) = 2
+                                            action, new_count = autoscaler.evaluate_scaling(
+                                                demand=0, current=4, state=state
+                                            )
+
+        assert action == "down"
+        assert new_count == 2  # 4 - 2
 
 
 if __name__ == "__main__":

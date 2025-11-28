@@ -34,6 +34,7 @@ docker run -e TOKEN=<pat> -e ORG=<org> do-actions-runner
 | `REPO` | For repo | Repository name |
 | `ORG` | For org | Organization name |
 | `NAME` | No | Custom runner name (default: hostname) |
+| `RUNNERS_PER_INSTANCE` | No | Number of runner processes per container (default: 1) |
 
 ## Guidelines for AI Agents
 

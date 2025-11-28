@@ -59,6 +59,9 @@ SCALE_DOWN_PROPORTION = float(os.environ.get("SCALE_DOWN_PROPORTION", "0.5"))
 # Runner filtering
 RUNNER_NAME_PREFIX = os.environ.get("RUNNER_NAME_PREFIX", "")
 
+# Multiple runners per instance
+RUNNERS_PER_INSTANCE = int(os.environ.get("RUNNERS_PER_INSTANCE", "1"))
+
 # Stabilization with time decay
 STABILIZATION_WINDOW_MINUTES = int(os.environ.get("STABILIZATION_WINDOW_MINUTES", "3"))
 DECAY_HALF_LIFE_SECONDS = float(os.environ.get("DECAY_HALF_LIFE_SECONDS", "30"))
@@ -100,6 +103,8 @@ def validate_config() -> None:
         errors.append("SCALE_UP_PROPORTION must be > 0 and <= 1")
     if not 0 < SCALE_DOWN_PROPORTION <= 1:
         errors.append("SCALE_DOWN_PROPORTION must be > 0 and <= 1")
+    if RUNNERS_PER_INSTANCE < 1:
+        errors.append("RUNNERS_PER_INSTANCE must be >= 1")
 
     if errors:
         for e in errors:
@@ -231,7 +236,8 @@ def get_current_instance_count() -> int:
     for worker in app.get("spec", {}).get("workers", []):
         if worker.get("name") == WORKER_NAME:
             count = worker.get("instance_count", 1)
-            log.info(f"Current {WORKER_NAME} instances: {count}")
+            capacity = count * RUNNERS_PER_INSTANCE
+            log.info(f"Current {WORKER_NAME}: {count} instances, {capacity} runners capacity")
             return count
 
     log.warning(f"Worker '{WORKER_NAME}' not found in app spec")
@@ -294,15 +300,25 @@ def scale_worker(desired_count: int) -> bool:
     return True
 
 
-def should_scale_up(demand: int, current: int) -> bool:
-    """Check if scale-up threshold is met."""
-    threshold = current * SCALE_UP_THRESHOLD
+def should_scale_up(demand: int, capacity: int) -> bool:
+    """Check if scale-up threshold is met.
+
+    Args:
+        demand: Total job demand (queued + in_progress jobs).
+        capacity: Total runner capacity (instances × RUNNERS_PER_INSTANCE).
+    """
+    threshold = capacity * SCALE_UP_THRESHOLD
     return demand > threshold
 
 
-def should_scale_down(demand: int, current: int) -> bool:
-    """Check if scale-down threshold is met."""
-    threshold = current * SCALE_DOWN_THRESHOLD
+def should_scale_down(demand: int, capacity: int) -> bool:
+    """Check if scale-down threshold is met.
+
+    Args:
+        demand: Total job demand (queued + in_progress jobs).
+        capacity: Total runner capacity (instances × RUNNERS_PER_INSTANCE).
+    """
+    threshold = capacity * SCALE_DOWN_THRESHOLD
     return demand < threshold
 
 
@@ -369,12 +385,15 @@ def evaluate_scaling(
     Returns:
         tuple of (action, new_count) where action is "up", "down", or "none"
     """
+    # Calculate total runner capacity
+    capacity = current * RUNNERS_PER_INSTANCE
+
     # Check scale-up condition
-    if should_scale_up(demand, current):
+    if should_scale_up(demand, capacity):
         record_breach(state, "up")
         score = calculate_breach_score(state, "up")
         log.info(
-            f"Scale-up condition met (demand {demand} > {current * SCALE_UP_THRESHOLD:.1f}), "
+            f"Scale-up condition met (demand {demand} > {capacity * SCALE_UP_THRESHOLD:.1f}), "
             f"breach score: {score:.2f}/{BREACH_THRESHOLD}"
         )
 
@@ -384,22 +403,29 @@ def evaluate_scaling(
                 log.info(f"Scale-up blocked by cooldown ({remaining:.0f}s remaining)")
                 return ("none", current)
 
-            # Proportional scaling: scale by fraction of deficit, capped at SCALE_UP_STEP
-            deficit = demand - current
-            step = min(max(int(deficit * SCALE_UP_PROPORTION), 1), SCALE_UP_STEP)
-            new_count = min(current + step, MAX_INSTANCES)
-            log.info(f"Scale-up step: {step} (deficit={deficit}, proportion={SCALE_UP_PROPORTION})")
+            # Proportional scaling: scale by fraction of runner deficit, converted to instances
+            runner_deficit = demand - capacity
+            # Convert runner deficit to instance step (at least 1 instance, at most SCALE_UP_STEP)
+            instance_step = min(
+                max(int((runner_deficit * SCALE_UP_PROPORTION) / RUNNERS_PER_INSTANCE + 0.5), 1),
+                SCALE_UP_STEP
+            )
+            new_count = min(current + instance_step, MAX_INSTANCES)
+            log.info(
+                f"Scale-up step: {instance_step} instances "
+                f"(runner_deficit={runner_deficit}, proportion={SCALE_UP_PROPORTION})"
+            )
             if new_count > current:
                 return ("up", new_count)
             else:
                 log.info(f"Already at MAX_INSTANCES ({MAX_INSTANCES})")
 
     # Check scale-down condition
-    elif should_scale_down(demand, current):
+    elif should_scale_down(demand, capacity):
         record_breach(state, "down")
         score = calculate_breach_score(state, "down")
         log.info(
-            f"Scale-down condition met (demand {demand} < {current * SCALE_DOWN_THRESHOLD:.1f}), "
+            f"Scale-down condition met (demand {demand} < {capacity * SCALE_DOWN_THRESHOLD:.1f}), "
             f"breach score: {score:.2f}/{BREACH_THRESHOLD}"
         )
 
@@ -409,11 +435,18 @@ def evaluate_scaling(
                 log.info(f"Scale-down blocked by cooldown ({remaining:.0f}s remaining)")
                 return ("none", current)
 
-            # Proportional scaling: scale by fraction of excess, capped at SCALE_DOWN_STEP
-            excess = current - demand
-            step = min(max(int(excess * SCALE_DOWN_PROPORTION), 1), SCALE_DOWN_STEP)
-            new_count = max(current - step, MIN_INSTANCES)
-            log.info(f"Scale-down step: {step} (excess={excess}, proportion={SCALE_DOWN_PROPORTION})")
+            # Proportional scaling: scale by fraction of runner excess, converted to instances
+            runner_excess = capacity - demand
+            # Convert runner excess to instance step (at least 1 instance, at most SCALE_DOWN_STEP)
+            instance_step = min(
+                max(int((runner_excess * SCALE_DOWN_PROPORTION) / RUNNERS_PER_INSTANCE), 1),
+                SCALE_DOWN_STEP
+            )
+            new_count = max(current - instance_step, MIN_INSTANCES)
+            log.info(
+                f"Scale-down step: {instance_step} instances "
+                f"(runner_excess={runner_excess}, proportion={SCALE_DOWN_PROPORTION})"
+            )
             if new_count < current:
                 return ("down", new_count)
             else:
@@ -520,6 +553,7 @@ def main():
     log.info(f"  Scale-up proportion: {SCALE_UP_PROPORTION}")
     log.info(f"  Scale-down proportion: {SCALE_DOWN_PROPORTION}")
     log.info(f"  Runner name prefix: '{RUNNER_NAME_PREFIX}' (empty=all self-hosted)")
+    log.info(f"  Runners per instance: {RUNNERS_PER_INSTANCE}")
 
     if not all([GITHUB_TOKEN, DO_API_TOKEN, APP_ID]):
         log.error("GITHUB_TOKEN, DO_API_TOKEN, and APP_ID are required")
