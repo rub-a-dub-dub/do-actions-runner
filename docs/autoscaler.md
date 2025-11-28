@@ -52,30 +52,44 @@ Example with defaults (1.5x up, 0.25x down):
 - 2 instances, 1 queued job → stable (1 is not > 3.0 and not < 0.5)
 - 2 instances, 0 queued jobs → scale down (0 < 0.5)
 
-### 2. Stabilization Window
+### 2. Time-Decay Stabilization
 
-Scaling only occurs after N consecutive readings confirm the condition:
-
-```
-Reading 1: queued=5 → Scale-up condition met (1/3)
-Reading 2: queued=6 → Scale-up condition met (2/3)
-Reading 3: queued=4 → Scale-up condition met (3/3) → SCALE UP
-```
-
-If the condition isn't met for a reading, the counter resets:
+Scaling decisions use a time-weighted breach score instead of simple consecutive counts. Each threshold breach is recorded with a timestamp and contributes to a cumulative score using exponential decay:
 
 ```
-Reading 1: queued=5 → Scale-up condition met (1/3)
-Reading 2: queued=1 → Stable (counters reset to 0)
-Reading 3: queued=5 → Scale-up condition met (1/3)
+breach_score = Σ 0.5^(age_seconds / DECAY_HALF_LIFE_SECONDS)
 ```
 
-### 3. Cooldown Periods
+Scaling triggers when `breach_score >= BREACH_THRESHOLD`.
 
-After scaling, further scaling in the same direction is blocked:
+**How it works:**
+- Each breach starts with weight ~1.0
+- Weight halves every `DECAY_HALF_LIFE_SECONDS` (default: 30s)
+- Breaches older than `STABILIZATION_WINDOW_MINUTES` (default: 3min) are pruned
+- Default `BREACH_THRESHOLD` is 2.0 (roughly 2+ recent breaches needed)
+
+**Benefits over consecutive counts:**
+- More responsive to sustained conditions
+- Brief fluctuations don't completely reset progress
+- Natural smoothing of noisy data
+
+### 3. Step-Based Scaling
+
+Scaling uses asymmetric step sizes to handle bursts efficiently while scaling down conservatively:
+
+- **Scale-up**: Add `SCALE_UP_STEP` instances (default: +2)
+- **Scale-down**: Remove `SCALE_DOWN_STEP` instances (default: -1)
+
+This allows the system to react quickly to job bursts while scaling down gradually as load decreases.
+
+### 4. Independent Cooldown Periods
+
+After scaling, further scaling **in the same direction** is blocked. Each direction has its own cooldown:
 
 - **Scale-up cooldown**: Default 60 seconds
 - **Scale-down cooldown**: Default 180 seconds (longer to let new instances stabilize)
+
+**Important**: Cooldowns are independent. Scale-up during a scale-down cooldown is allowed (and vice versa). This enables quick response to sudden load spikes even after scaling down.
 
 ## Dead Runner Cleanup
 
@@ -105,31 +119,48 @@ This handles runners that crashed without deregistering.
 | `SCALE_DOWN_THRESHOLD` | `0.25` | Multiplier for scale-down trigger |
 | `SCALE_UP_COOLDOWN` | `60` | Seconds to wait after scale-up |
 | `SCALE_DOWN_COOLDOWN` | `180` | Seconds to wait after scale-down |
-| `STABILIZATION_WINDOW` | `3` | Consecutive readings required |
+| `SCALE_UP_STEP` | `2` | Instances to add when scaling up |
+| `SCALE_DOWN_STEP` | `1` | Instances to remove when scaling down |
+| `STABILIZATION_WINDOW_MINUTES` | `3` | Time window for breach history |
+| `DECAY_HALF_LIFE_SECONDS` | `30` | Half-life for breach score decay |
+| `BREACH_THRESHOLD` | `2.0` | Score needed to trigger scaling |
 
 ## Scaling Behavior Examples
 
 ### Burst of Jobs
 
+With defaults (`SCALE_UP_STEP=2`, `BREACH_THRESHOLD=2.0`, `POLL_INTERVAL=60`):
+
 ```
 t=0:   queued=0, instances=1 → stable
-t=60:  queued=5, instances=1 → scale-up condition (1/3)
-t=120: queued=8, instances=1 → scale-up condition (2/3)
-t=180: queued=6, instances=1 → scale-up condition (3/3) → scale to 2
-t=240: queued=6, instances=2 → scale-up blocked (cooldown)
-t=300: queued=5, instances=2 → scale-up condition (1/3)
+t=60:  queued=5, instances=1 → scale-up breach recorded (score ~1.0)
+t=120: queued=8, instances=1 → scale-up breach recorded (score ~2.0) → scale to 3
+t=180: queued=6, instances=3 → scale-up blocked (cooldown)
+t=240: queued=5, instances=3 → cooldown expired, stable (5 < 4.5)
 ...
 ```
 
 ### Jobs Complete
 
+With defaults (`SCALE_DOWN_STEP=1`, `BREACH_THRESHOLD=2.0`):
+
 ```
 t=0:   queued=3, instances=3 → stable
 t=60:  queued=1, instances=3 → stable (1 > 0.75)
-t=120: queued=0, instances=3 → scale-down condition (1/3)
-t=180: queued=0, instances=3 → scale-down condition (2/3)
-t=240: queued=0, instances=3 → scale-down condition (3/3) → scale to 2
-t=420: queued=0, instances=2 → scale-down condition (3/3) → scale to 1
+t=120: queued=0, instances=3 → scale-down breach recorded (score ~1.0)
+t=180: queued=0, instances=3 → scale-down breach recorded (score ~2.0) → scale to 2
+t=360: queued=0, instances=2 → cooldown expired, breach score ~2.0 → scale to 1
+```
+
+### Rapid Response to Load Spike
+
+Independent cooldowns allow quick response to load changes:
+
+```
+t=0:   instances=3, just scaled down
+t=30:  queued=10 → scale-up allowed (down cooldown doesn't block up)
+       breach recorded (score ~1.0)
+t=90:  queued=12 → breach recorded (score ~2.0) → scale to 5
 ```
 
 ## Local Testing

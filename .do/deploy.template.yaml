@@ -65,9 +65,21 @@ spec:
     - key: SCALE_DOWN_THRESHOLD
       scope: RUN_TIME
       value: "0.25"
-    - key: STABILIZATION_WINDOW
+    - key: SCALE_UP_STEP
+      scope: RUN_TIME
+      value: "2"
+    - key: SCALE_DOWN_STEP
+      scope: RUN_TIME
+      value: "1"
+    - key: STABILIZATION_WINDOW_MINUTES
       scope: RUN_TIME
       value: "3"
+    - key: DECAY_HALF_LIFE_SECONDS
+      scope: RUN_TIME
+      value: "30"
+    - key: BREACH_THRESHOLD
+      scope: RUN_TIME
+      value: "2.0"
     git:
       branch: main
       repo_clone_url: https://github.com/rub-a-dub-dub/do-actions-runner.git

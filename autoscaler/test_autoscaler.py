@@ -15,7 +15,7 @@ os.environ["OWNER"] = "test-owner"
 os.environ["REPO"] = "test-repo"
 
 import autoscaler
-from autoscaler import ScalingState
+from autoscaler import ScalingState, validate_config
 
 
 class TestScalingState:
@@ -24,10 +24,99 @@ class TestScalingState:
     def test_default_values(self):
         """Should initialize with default values."""
         state = ScalingState()
-        assert state.last_scale_time == 0
-        assert state.last_scale_direction == ""
-        assert state.consecutive_scale_up_readings == 0
-        assert state.consecutive_scale_down_readings == 0
+        assert state.last_scale_up_time == 0
+        assert state.last_scale_down_time == 0
+        assert state.breach_history == []
+
+
+class TestBreachScore:
+    """Tests for breach score calculations."""
+
+    def test_breach_score_zero_with_no_history(self):
+        """Should return 0 when no breaches recorded."""
+        state = ScalingState()
+        assert autoscaler.calculate_breach_score(state, "up") == 0.0
+        assert autoscaler.calculate_breach_score(state, "down") == 0.0
+
+    def test_breach_score_recent_breaches(self):
+        """Recent breaches should have high weight (close to 1)."""
+        state = ScalingState()
+        now = time.time()
+        state.breach_history = [(now, "up")]
+
+        with patch.object(autoscaler, "DECAY_HALF_LIFE_SECONDS", 30):
+            with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
+                score = autoscaler.calculate_breach_score(state, "up")
+                # Recent breach should have weight close to 1.0
+                assert score > 0.9
+
+    def test_breach_score_decays_over_time(self):
+        """Breach score should decay exponentially over time."""
+        state = ScalingState()
+        now = time.time()
+        # Breach from 30 seconds ago (one half-life)
+        state.breach_history = [(now - 30, "up")]
+
+        with patch.object(autoscaler, "DECAY_HALF_LIFE_SECONDS", 30):
+            with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
+                score = autoscaler.calculate_breach_score(state, "up")
+                # After one half-life, weight should be ~0.5
+                assert 0.4 < score < 0.6
+
+    def test_breach_score_zero_outside_window(self):
+        """Breaches outside window should be pruned and not counted."""
+        state = ScalingState()
+        now = time.time()
+        # Breach from 5 minutes ago (outside 3-minute window)
+        state.breach_history = [(now - 300, "up")]
+
+        with patch.object(autoscaler, "DECAY_HALF_LIFE_SECONDS", 30):
+            with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
+                score = autoscaler.calculate_breach_score(state, "up")
+                assert score == 0.0
+                # History should be pruned
+                assert len(state.breach_history) == 0
+
+    def test_breach_score_cumulative(self):
+        """Multiple breaches should accumulate."""
+        state = ScalingState()
+        now = time.time()
+        # Multiple recent breaches
+        state.breach_history = [
+            (now - 1, "up"),
+            (now - 2, "up"),
+            (now - 3, "up"),
+        ]
+
+        with patch.object(autoscaler, "DECAY_HALF_LIFE_SECONDS", 30):
+            with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
+                score = autoscaler.calculate_breach_score(state, "up")
+                # 3 recent breaches should have score close to 3.0
+                assert score > 2.5
+
+    def test_breach_score_ignores_opposite_direction(self):
+        """Should only count breaches for the requested direction."""
+        state = ScalingState()
+        now = time.time()
+        state.breach_history = [
+            (now - 1, "up"),
+            (now - 2, "down"),
+        ]
+
+        with patch.object(autoscaler, "DECAY_HALF_LIFE_SECONDS", 30):
+            with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
+                up_score = autoscaler.calculate_breach_score(state, "up")
+                down_score = autoscaler.calculate_breach_score(state, "down")
+                # Each direction should only count its own breaches
+                assert up_score < 1.5
+                assert down_score < 1.5
+
+    def test_record_breach(self):
+        """Should append breach to history."""
+        state = ScalingState()
+        autoscaler.record_breach(state, "up")
+        assert len(state.breach_history) == 1
+        assert state.breach_history[0][1] == "up"
 
 
 class TestThresholds:
@@ -64,115 +153,161 @@ class TestCooldown:
         assert autoscaler.is_cooldown_active(state, "down") is False
 
     def test_scale_up_cooldown_active(self):
-        """Should block scale-up during cooldown period."""
-        state = ScalingState(last_scale_time=time.time())
+        """Should block scale-up during its cooldown period."""
+        state = ScalingState(last_scale_up_time=time.time())
         with patch.object(autoscaler, "SCALE_UP_COOLDOWN", 60):
             assert autoscaler.is_cooldown_active(state, "up") is True
 
     def test_scale_up_cooldown_expired(self):
-        """Should allow scale-up after cooldown period."""
-        state = ScalingState(last_scale_time=time.time() - 120)  # 2 minutes ago
+        """Should allow scale-up after its cooldown period."""
+        state = ScalingState(last_scale_up_time=time.time() - 120)  # 2 minutes ago
         with patch.object(autoscaler, "SCALE_UP_COOLDOWN", 60):
             assert autoscaler.is_cooldown_active(state, "up") is False
 
     def test_scale_down_cooldown_active(self):
-        """Should block scale-down during cooldown period."""
-        state = ScalingState(last_scale_time=time.time())
+        """Should block scale-down during its cooldown period."""
+        state = ScalingState(last_scale_down_time=time.time())
         with patch.object(autoscaler, "SCALE_DOWN_COOLDOWN", 180):
             assert autoscaler.is_cooldown_active(state, "down") is True
 
     def test_scale_down_cooldown_expired(self):
-        """Should allow scale-down after cooldown period."""
-        state = ScalingState(last_scale_time=time.time() - 200)  # 200 seconds ago
+        """Should allow scale-down after its cooldown period."""
+        state = ScalingState(last_scale_down_time=time.time() - 200)  # 200 seconds ago
         with patch.object(autoscaler, "SCALE_DOWN_COOLDOWN", 180):
             assert autoscaler.is_cooldown_active(state, "down") is False
+
+    def test_scale_up_allowed_during_down_cooldown(self):
+        """Should allow scale-up even when scale-down is in cooldown."""
+        state = ScalingState(
+            last_scale_down_time=time.time(),  # Just scaled down
+            last_scale_up_time=0,  # Never scaled up
+        )
+        with patch.object(autoscaler, "SCALE_UP_COOLDOWN", 60):
+            with patch.object(autoscaler, "SCALE_DOWN_COOLDOWN", 180):
+                # Scale-down cooldown is active
+                assert autoscaler.is_cooldown_active(state, "down") is True
+                # But scale-up should be allowed
+                assert autoscaler.is_cooldown_active(state, "up") is False
+
+    def test_scale_down_allowed_during_up_cooldown(self):
+        """Should allow scale-down even when scale-up is in cooldown."""
+        state = ScalingState(
+            last_scale_up_time=time.time(),  # Just scaled up
+            last_scale_down_time=0,  # Never scaled down
+        )
+        with patch.object(autoscaler, "SCALE_UP_COOLDOWN", 60):
+            with patch.object(autoscaler, "SCALE_DOWN_COOLDOWN", 180):
+                # Scale-up cooldown is active
+                assert autoscaler.is_cooldown_active(state, "up") is True
+                # But scale-down should be allowed
+                assert autoscaler.is_cooldown_active(state, "down") is False
 
 
 class TestEvaluateScaling:
     """Tests for evaluate_scaling function."""
 
-    def test_scale_up_after_stabilization(self):
-        """Should scale up after stabilization window is met."""
-        state = ScalingState(consecutive_scale_up_readings=2)  # Already 2 readings
+    def _create_state_with_breach_score(self, direction: str, score: float) -> ScalingState:
+        """Helper to create a state with pre-populated breach history achieving target score."""
+        state = ScalingState()
+        now = time.time()
+        # Add recent breaches to achieve desired score (each recent breach ~= 1.0)
+        for i in range(int(score + 1)):
+            state.breach_history.append((now - i * 0.1, direction))
+        return state
+
+    def test_scale_up_after_breach_threshold(self):
+        """Should scale up by SCALE_UP_STEP after breach threshold is met."""
+        # Pre-populate with enough breaches to be just under threshold
+        state = self._create_state_with_breach_score("up", 1.5)
 
         with patch.object(autoscaler, "SCALE_UP_THRESHOLD", 1.5):
             with patch.object(autoscaler, "SCALE_DOWN_THRESHOLD", 0.25):
-                with patch.object(autoscaler, "STABILIZATION_WINDOW", 3):
-                    with patch.object(autoscaler, "MAX_INSTANCES", 5):
-                        # queued=4, current=2: 4 > 2*1.5=3.0, should trigger scale-up
-                        action, new_count = autoscaler.evaluate_scaling(
-                            queued=4, current=2, state=state
-                        )
+                with patch.object(autoscaler, "BREACH_THRESHOLD", 2.0):
+                    with patch.object(autoscaler, "DECAY_HALF_LIFE_SECONDS", 30):
+                        with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
+                            with patch.object(autoscaler, "MAX_INSTANCES", 5):
+                                with patch.object(autoscaler, "SCALE_UP_STEP", 2):
+                                    # queued=4, current=2: 4 > 2*1.5=3.0, should trigger scale-up
+                                    action, new_count = autoscaler.evaluate_scaling(
+                                        queued=4, current=2, state=state
+                                    )
 
         assert action == "up"
-        assert new_count == 3  # +1 from current
+        assert new_count == 4  # +2 from current (SCALE_UP_STEP=2)
 
-    def test_scale_up_blocked_before_stabilization(self):
-        """Should not scale up before stabilization window is met."""
-        state = ScalingState(consecutive_scale_up_readings=0)
+    def test_scale_up_blocked_before_breach_threshold(self):
+        """Should not scale up before breach threshold is met."""
+        state = ScalingState()  # Empty breach history
 
         with patch.object(autoscaler, "SCALE_UP_THRESHOLD", 1.5):
             with patch.object(autoscaler, "SCALE_DOWN_THRESHOLD", 0.25):
-                with patch.object(autoscaler, "STABILIZATION_WINDOW", 3):
-                    with patch.object(autoscaler, "MAX_INSTANCES", 5):
-                        action, new_count = autoscaler.evaluate_scaling(
-                            queued=4, current=2, state=state
-                        )
+                with patch.object(autoscaler, "BREACH_THRESHOLD", 2.0):
+                    with patch.object(autoscaler, "DECAY_HALF_LIFE_SECONDS", 30):
+                        with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
+                            with patch.object(autoscaler, "MAX_INSTANCES", 5):
+                                action, new_count = autoscaler.evaluate_scaling(
+                                    queued=4, current=2, state=state
+                                )
 
         assert action == "none"
         assert new_count == 2
-        assert state.consecutive_scale_up_readings == 1  # Incremented
+        # Breach should be recorded
+        assert len(state.breach_history) == 1
+        assert state.breach_history[0][1] == "up"
 
     def test_scale_up_blocked_by_cooldown(self):
-        """Should not scale up during cooldown even if stabilization met."""
-        state = ScalingState(
-            consecutive_scale_up_readings=2,
-            last_scale_time=time.time(),  # Just scaled
-        )
+        """Should not scale up during cooldown even if breach threshold met."""
+        state = self._create_state_with_breach_score("up", 2.5)
+        state.last_scale_up_time = time.time()  # Just scaled up
 
         with patch.object(autoscaler, "SCALE_UP_THRESHOLD", 1.5):
             with patch.object(autoscaler, "SCALE_DOWN_THRESHOLD", 0.25):
-                with patch.object(autoscaler, "STABILIZATION_WINDOW", 3):
-                    with patch.object(autoscaler, "SCALE_UP_COOLDOWN", 60):
-                        with patch.object(autoscaler, "MAX_INSTANCES", 5):
-                            action, new_count = autoscaler.evaluate_scaling(
-                                queued=4, current=2, state=state
-                            )
+                with patch.object(autoscaler, "BREACH_THRESHOLD", 2.0):
+                    with patch.object(autoscaler, "DECAY_HALF_LIFE_SECONDS", 30):
+                        with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
+                            with patch.object(autoscaler, "SCALE_UP_COOLDOWN", 60):
+                                with patch.object(autoscaler, "MAX_INSTANCES", 5):
+                                    action, new_count = autoscaler.evaluate_scaling(
+                                        queued=4, current=2, state=state
+                                    )
 
         assert action == "none"
         assert new_count == 2
 
-    def test_scale_down_after_stabilization(self):
-        """Should scale down after stabilization window is met."""
-        state = ScalingState(consecutive_scale_down_readings=2)
+    def test_scale_down_after_breach_threshold(self):
+        """Should scale down by SCALE_DOWN_STEP after breach threshold is met."""
+        state = self._create_state_with_breach_score("down", 1.5)
 
         with patch.object(autoscaler, "SCALE_UP_THRESHOLD", 1.5):
             with patch.object(autoscaler, "SCALE_DOWN_THRESHOLD", 0.25):
-                with patch.object(autoscaler, "STABILIZATION_WINDOW", 3):
-                    with patch.object(autoscaler, "MIN_INSTANCES", 1):
-                        # queued=0, current=4: 0 < 4*0.25=1.0, should trigger scale-down
-                        action, new_count = autoscaler.evaluate_scaling(
-                            queued=0, current=4, state=state
-                        )
+                with patch.object(autoscaler, "BREACH_THRESHOLD", 2.0):
+                    with patch.object(autoscaler, "DECAY_HALF_LIFE_SECONDS", 30):
+                        with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
+                            with patch.object(autoscaler, "MIN_INSTANCES", 1):
+                                with patch.object(autoscaler, "SCALE_DOWN_STEP", 1):
+                                    # queued=0, current=4: 0 < 4*0.25=1.0, should trigger scale-down
+                                    action, new_count = autoscaler.evaluate_scaling(
+                                        queued=0, current=4, state=state
+                                    )
 
         assert action == "down"
-        assert new_count == 3  # -1 from current
+        assert new_count == 3  # -1 from current (SCALE_DOWN_STEP=1)
 
     def test_scale_down_blocked_by_cooldown(self):
-        """Should not scale down during cooldown even if stabilization met."""
-        state = ScalingState(
-            consecutive_scale_down_readings=2,
-            last_scale_time=time.time(),
-        )
+        """Should not scale down during cooldown even if breach threshold met."""
+        state = self._create_state_with_breach_score("down", 2.5)
+        state.last_scale_down_time = time.time()  # Just scaled down
 
         with patch.object(autoscaler, "SCALE_UP_THRESHOLD", 1.5):
             with patch.object(autoscaler, "SCALE_DOWN_THRESHOLD", 0.25):
-                with patch.object(autoscaler, "STABILIZATION_WINDOW", 3):
-                    with patch.object(autoscaler, "SCALE_DOWN_COOLDOWN", 180):
-                        with patch.object(autoscaler, "MIN_INSTANCES", 1):
-                            action, new_count = autoscaler.evaluate_scaling(
-                                queued=0, current=4, state=state
-                            )
+                with patch.object(autoscaler, "BREACH_THRESHOLD", 2.0):
+                    with patch.object(autoscaler, "DECAY_HALF_LIFE_SECONDS", 30):
+                        with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
+                            with patch.object(autoscaler, "SCALE_DOWN_COOLDOWN", 180):
+                                with patch.object(autoscaler, "MIN_INSTANCES", 1):
+                                    action, new_count = autoscaler.evaluate_scaling(
+                                        queued=0, current=4, state=state
+                                    )
 
         assert action == "none"
         assert new_count == 4
@@ -183,57 +318,123 @@ class TestEvaluateScaling:
 
         with patch.object(autoscaler, "SCALE_UP_THRESHOLD", 1.5):
             with patch.object(autoscaler, "SCALE_DOWN_THRESHOLD", 0.25):
-                # queued=1, current=2: 1 < 3.0 (no scale-up), 1 > 0.5 (no scale-down)
-                action, new_count = autoscaler.evaluate_scaling(
-                    queued=1, current=2, state=state
-                )
+                with patch.object(autoscaler, "BREACH_THRESHOLD", 2.0):
+                    with patch.object(autoscaler, "DECAY_HALF_LIFE_SECONDS", 30):
+                        with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
+                            # queued=1, current=2: 1 < 3.0 (no scale-up), 1 > 0.5 (no scale-down)
+                            action, new_count = autoscaler.evaluate_scaling(
+                                queued=1, current=2, state=state
+                            )
 
         assert action == "none"
         assert new_count == 2
-        assert state.consecutive_scale_up_readings == 0
-        assert state.consecutive_scale_down_readings == 0
+        # No breaches recorded when stable
+        assert len(state.breach_history) == 0
 
     def test_respects_max_instances(self):
         """Should not scale above MAX_INSTANCES."""
-        state = ScalingState(consecutive_scale_up_readings=2)
+        state = self._create_state_with_breach_score("up", 2.5)
 
         with patch.object(autoscaler, "SCALE_UP_THRESHOLD", 1.5):
             with patch.object(autoscaler, "SCALE_DOWN_THRESHOLD", 0.25):
-                with patch.object(autoscaler, "STABILIZATION_WINDOW", 3):
-                    with patch.object(autoscaler, "MAX_INSTANCES", 5):
-                        action, new_count = autoscaler.evaluate_scaling(
-                            queued=10, current=5, state=state
-                        )
+                with patch.object(autoscaler, "BREACH_THRESHOLD", 2.0):
+                    with patch.object(autoscaler, "DECAY_HALF_LIFE_SECONDS", 30):
+                        with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
+                            with patch.object(autoscaler, "MAX_INSTANCES", 5):
+                                action, new_count = autoscaler.evaluate_scaling(
+                                    queued=10, current=5, state=state
+                                )
 
         assert action == "none"
         assert new_count == 5
 
     def test_respects_min_instances(self):
         """Should not scale below MIN_INSTANCES."""
-        state = ScalingState(consecutive_scale_down_readings=2)
+        state = self._create_state_with_breach_score("down", 2.5)
 
         with patch.object(autoscaler, "SCALE_UP_THRESHOLD", 1.5):
             with patch.object(autoscaler, "SCALE_DOWN_THRESHOLD", 0.25):
-                with patch.object(autoscaler, "STABILIZATION_WINDOW", 3):
-                    with patch.object(autoscaler, "MIN_INSTANCES", 1):
-                        action, new_count = autoscaler.evaluate_scaling(
-                            queued=0, current=1, state=state
-                        )
+                with patch.object(autoscaler, "BREACH_THRESHOLD", 2.0):
+                    with patch.object(autoscaler, "DECAY_HALF_LIFE_SECONDS", 30):
+                        with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
+                            with patch.object(autoscaler, "MIN_INSTANCES", 1):
+                                action, new_count = autoscaler.evaluate_scaling(
+                                    queued=0, current=1, state=state
+                                )
 
         assert action == "none"
         assert new_count == 1
 
-    def test_resets_opposite_counter_on_scale_up(self):
-        """Should reset scale-down counter when scale-up condition met."""
-        state = ScalingState(consecutive_scale_down_readings=2)
+    def test_scale_up_records_breach(self):
+        """Should record breach when scale-up condition met."""
+        state = ScalingState()
 
         with patch.object(autoscaler, "SCALE_UP_THRESHOLD", 1.5):
             with patch.object(autoscaler, "SCALE_DOWN_THRESHOLD", 0.25):
-                with patch.object(autoscaler, "STABILIZATION_WINDOW", 3):
-                    autoscaler.evaluate_scaling(queued=4, current=2, state=state)
+                with patch.object(autoscaler, "BREACH_THRESHOLD", 2.0):
+                    with patch.object(autoscaler, "DECAY_HALF_LIFE_SECONDS", 30):
+                        with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
+                            autoscaler.evaluate_scaling(queued=4, current=2, state=state)
 
-        assert state.consecutive_scale_down_readings == 0
-        assert state.consecutive_scale_up_readings == 1
+        assert len(state.breach_history) == 1
+        assert state.breach_history[0][1] == "up"
+
+    def test_scale_up_by_step_respects_max(self):
+        """Should not scale above MAX_INSTANCES even with step > 1."""
+        state = self._create_state_with_breach_score("up", 2.5)
+
+        with patch.object(autoscaler, "SCALE_UP_THRESHOLD", 1.5):
+            with patch.object(autoscaler, "SCALE_DOWN_THRESHOLD", 0.25):
+                with patch.object(autoscaler, "BREACH_THRESHOLD", 2.0):
+                    with patch.object(autoscaler, "DECAY_HALF_LIFE_SECONDS", 30):
+                        with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
+                            with patch.object(autoscaler, "MAX_INSTANCES", 5):
+                                with patch.object(autoscaler, "SCALE_UP_STEP", 2):
+                                    # current=4, step=2, max=5 -> should go to 5, not 6
+                                    action, new_count = autoscaler.evaluate_scaling(
+                                        queued=10, current=4, state=state
+                                    )
+
+        assert action == "up"
+        assert new_count == 5  # Capped at MAX_INSTANCES
+
+    def test_scale_down_by_larger_step(self):
+        """Should scale down by SCALE_DOWN_STEP when configured."""
+        state = self._create_state_with_breach_score("down", 2.5)
+
+        with patch.object(autoscaler, "SCALE_UP_THRESHOLD", 1.5):
+            with patch.object(autoscaler, "SCALE_DOWN_THRESHOLD", 0.25):
+                with patch.object(autoscaler, "BREACH_THRESHOLD", 2.0):
+                    with patch.object(autoscaler, "DECAY_HALF_LIFE_SECONDS", 30):
+                        with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
+                            with patch.object(autoscaler, "MIN_INSTANCES", 1):
+                                with patch.object(autoscaler, "SCALE_DOWN_STEP", 2):
+                                    # current=5, step=2 -> should go to 3
+                                    action, new_count = autoscaler.evaluate_scaling(
+                                        queued=0, current=5, state=state
+                                    )
+
+        assert action == "down"
+        assert new_count == 3  # 5 - 2 = 3
+
+    def test_scale_down_by_step_respects_min(self):
+        """Should not scale below MIN_INSTANCES even with step > 1."""
+        state = self._create_state_with_breach_score("down", 2.5)
+
+        with patch.object(autoscaler, "SCALE_UP_THRESHOLD", 1.5):
+            with patch.object(autoscaler, "SCALE_DOWN_THRESHOLD", 0.25):
+                with patch.object(autoscaler, "BREACH_THRESHOLD", 2.0):
+                    with patch.object(autoscaler, "DECAY_HALF_LIFE_SECONDS", 30):
+                        with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
+                            with patch.object(autoscaler, "MIN_INSTANCES", 2):
+                                with patch.object(autoscaler, "SCALE_DOWN_STEP", 3):
+                                    # current=4, step=3, min=2 -> should go to 2, not 1
+                                    action, new_count = autoscaler.evaluate_scaling(
+                                        queued=0, current=4, state=state
+                                    )
+
+        assert action == "down"
+        assert new_count == 2  # Capped at MIN_INSTANCES
 
 
 class TestGetQueuedJobs:
@@ -363,7 +564,8 @@ class TestScaleWorker:
     @patch("autoscaler.requests.put")
     @patch("autoscaler.requests.get")
     def test_updates_instance_count(self, mock_get, mock_put):
-        """Should update the worker instance count via PUT."""
+        """Should update the worker instance count via PUT and return True."""
+        # First GET for initial spec, second GET for verification
         mock_get_response = MagicMock()
         mock_get_response.json.return_value = {
             "app": {
@@ -375,14 +577,27 @@ class TestScaleWorker:
                 }
             }
         }
-        mock_get.return_value = mock_get_response
+        # After PUT, verification returns the updated count
+        mock_verify_response = MagicMock()
+        mock_verify_response.json.return_value = {
+            "app": {
+                "spec": {
+                    "name": "test-app",
+                    "workers": [
+                        {"name": "runner", "instance_count": 3},
+                    ],
+                }
+            }
+        }
+        mock_get.side_effect = [mock_get_response, mock_verify_response]
 
         mock_put_response = MagicMock()
         mock_put.return_value = mock_put_response
 
         with patch.object(autoscaler, "WORKER_NAME", "runner"):
-            autoscaler.scale_worker(3)
+            result = autoscaler.scale_worker(3)
 
+        assert result is True
         mock_put.assert_called_once()
         call_json = mock_put.call_args[1]["json"]
         assert call_json["spec"]["workers"][0]["instance_count"] == 3
@@ -390,7 +605,7 @@ class TestScaleWorker:
     @patch("autoscaler.requests.put")
     @patch("autoscaler.requests.get")
     def test_does_not_update_if_worker_not_found(self, mock_get, mock_put):
-        """Should not call PUT if worker is not found."""
+        """Should not call PUT if worker is not found and return False."""
         mock_get_response = MagicMock()
         mock_get_response.json.return_value = {
             "app": {
@@ -403,9 +618,49 @@ class TestScaleWorker:
         mock_get.return_value = mock_get_response
 
         with patch.object(autoscaler, "WORKER_NAME", "runner"):
-            autoscaler.scale_worker(3)
+            result = autoscaler.scale_worker(3)
 
+        assert result is False
         mock_put.assert_not_called()
+
+    @patch("autoscaler.requests.put")
+    @patch("autoscaler.requests.get")
+    def test_returns_false_on_spec_conflict(self, mock_get, mock_put):
+        """Should return False when verification shows different count (conflict)."""
+        # First GET for initial spec
+        mock_get_response = MagicMock()
+        mock_get_response.json.return_value = {
+            "app": {
+                "spec": {
+                    "name": "test-app",
+                    "workers": [
+                        {"name": "runner", "instance_count": 1},
+                    ],
+                }
+            }
+        }
+        # After PUT, verification shows different count (concurrent modification)
+        mock_verify_response = MagicMock()
+        mock_verify_response.json.return_value = {
+            "app": {
+                "spec": {
+                    "name": "test-app",
+                    "workers": [
+                        {"name": "runner", "instance_count": 2},  # Someone else changed it
+                    ],
+                }
+            }
+        }
+        mock_get.side_effect = [mock_get_response, mock_verify_response]
+
+        mock_put_response = MagicMock()
+        mock_put.return_value = mock_put_response
+
+        with patch.object(autoscaler, "WORKER_NAME", "runner"):
+            result = autoscaler.scale_worker(3)
+
+        assert result is False
+        mock_put.assert_called_once()  # PUT was called, but verification failed
 
 
 class TestGetRunners:
@@ -531,6 +786,121 @@ class TestCleanupDeadRunners:
         result = autoscaler.cleanup_dead_runners()
 
         assert result == 0
+
+
+class TestValidateConfig:
+    """Tests for validate_config function."""
+
+    def test_validate_config_passes_valid_config(self):
+        """Should pass with valid configuration."""
+        with patch.object(autoscaler, "MIN_INSTANCES", 1):
+            with patch.object(autoscaler, "MAX_INSTANCES", 5):
+                with patch.object(autoscaler, "SCALE_UP_COOLDOWN", 60):
+                    with patch.object(autoscaler, "SCALE_DOWN_COOLDOWN", 180):
+                        with patch.object(autoscaler, "POLL_INTERVAL", 60):
+                            with patch.object(autoscaler, "SCALE_UP_STEP", 2):
+                                with patch.object(autoscaler, "SCALE_DOWN_STEP", 1):
+                                    with patch.object(autoscaler, "SCALE_UP_THRESHOLD", 1.5):
+                                        with patch.object(autoscaler, "SCALE_DOWN_THRESHOLD", 0.25):
+                                            with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 3):
+                                                with patch.object(autoscaler, "DECAY_HALF_LIFE_SECONDS", 30):
+                                                    with patch.object(autoscaler, "BREACH_THRESHOLD", 2.0):
+                                                        # Should not raise
+                                                        validate_config()
+
+    def test_validate_config_fails_min_greater_than_max(self):
+        """Should exit when MIN_INSTANCES > MAX_INSTANCES."""
+        with patch.object(autoscaler, "MIN_INSTANCES", 10):
+            with patch.object(autoscaler, "MAX_INSTANCES", 5):
+                with pytest.raises(SystemExit):
+                    validate_config()
+
+    def test_validate_config_fails_negative_min_instances(self):
+        """Should exit when MIN_INSTANCES < 0."""
+        with patch.object(autoscaler, "MIN_INSTANCES", -1):
+            with patch.object(autoscaler, "MAX_INSTANCES", 5):
+                with pytest.raises(SystemExit):
+                    validate_config()
+
+    def test_validate_config_fails_negative_cooldown(self):
+        """Should exit when cooldown is negative."""
+        with patch.object(autoscaler, "MIN_INSTANCES", 1):
+            with patch.object(autoscaler, "MAX_INSTANCES", 5):
+                with patch.object(autoscaler, "SCALE_UP_COOLDOWN", -1):
+                    with pytest.raises(SystemExit):
+                        validate_config()
+
+    def test_validate_config_fails_zero_poll_interval(self):
+        """Should exit when POLL_INTERVAL <= 0."""
+        with patch.object(autoscaler, "MIN_INSTANCES", 1):
+            with patch.object(autoscaler, "MAX_INSTANCES", 5):
+                with patch.object(autoscaler, "SCALE_UP_COOLDOWN", 60):
+                    with patch.object(autoscaler, "SCALE_DOWN_COOLDOWN", 180):
+                        with patch.object(autoscaler, "POLL_INTERVAL", 0):
+                            with pytest.raises(SystemExit):
+                                validate_config()
+
+    def test_validate_config_fails_zero_step_size(self):
+        """Should exit when step size < 1."""
+        with patch.object(autoscaler, "MIN_INSTANCES", 1):
+            with patch.object(autoscaler, "MAX_INSTANCES", 5):
+                with patch.object(autoscaler, "SCALE_UP_COOLDOWN", 60):
+                    with patch.object(autoscaler, "SCALE_DOWN_COOLDOWN", 180):
+                        with patch.object(autoscaler, "POLL_INTERVAL", 60):
+                            with patch.object(autoscaler, "SCALE_UP_STEP", 0):
+                                with pytest.raises(SystemExit):
+                                    validate_config()
+
+    def test_validate_config_fails_zero_scale_up_threshold(self):
+        """Should exit when SCALE_UP_THRESHOLD <= 0."""
+        with patch.object(autoscaler, "MIN_INSTANCES", 1):
+            with patch.object(autoscaler, "MAX_INSTANCES", 5):
+                with patch.object(autoscaler, "SCALE_UP_COOLDOWN", 60):
+                    with patch.object(autoscaler, "SCALE_DOWN_COOLDOWN", 180):
+                        with patch.object(autoscaler, "POLL_INTERVAL", 60):
+                            with patch.object(autoscaler, "SCALE_UP_STEP", 2):
+                                with patch.object(autoscaler, "SCALE_DOWN_STEP", 1):
+                                    with patch.object(autoscaler, "SCALE_UP_THRESHOLD", 0):
+                                        with pytest.raises(SystemExit):
+                                            validate_config()
+
+    def test_validate_config_fails_negative_scale_down_threshold(self):
+        """Should exit when SCALE_DOWN_THRESHOLD < 0."""
+        with patch.object(autoscaler, "MIN_INSTANCES", 1):
+            with patch.object(autoscaler, "MAX_INSTANCES", 5):
+                with patch.object(autoscaler, "SCALE_UP_COOLDOWN", 60):
+                    with patch.object(autoscaler, "SCALE_DOWN_COOLDOWN", 180):
+                        with patch.object(autoscaler, "POLL_INTERVAL", 60):
+                            with patch.object(autoscaler, "SCALE_UP_STEP", 2):
+                                with patch.object(autoscaler, "SCALE_DOWN_STEP", 1):
+                                    with patch.object(autoscaler, "SCALE_UP_THRESHOLD", 1.5):
+                                        with patch.object(autoscaler, "SCALE_DOWN_THRESHOLD", -1):
+                                            with pytest.raises(SystemExit):
+                                                validate_config()
+
+    def test_validate_config_fails_zero_stabilization_window(self):
+        """Should exit when STABILIZATION_WINDOW_MINUTES <= 0."""
+        with patch.object(autoscaler, "MIN_INSTANCES", 1):
+            with patch.object(autoscaler, "MAX_INSTANCES", 5):
+                with patch.object(autoscaler, "STABILIZATION_WINDOW_MINUTES", 0):
+                    with pytest.raises(SystemExit):
+                        validate_config()
+
+    def test_validate_config_fails_zero_decay_half_life(self):
+        """Should exit when DECAY_HALF_LIFE_SECONDS <= 0."""
+        with patch.object(autoscaler, "MIN_INSTANCES", 1):
+            with patch.object(autoscaler, "MAX_INSTANCES", 5):
+                with patch.object(autoscaler, "DECAY_HALF_LIFE_SECONDS", 0):
+                    with pytest.raises(SystemExit):
+                        validate_config()
+
+    def test_validate_config_fails_zero_breach_threshold(self):
+        """Should exit when BREACH_THRESHOLD <= 0."""
+        with patch.object(autoscaler, "MIN_INSTANCES", 1):
+            with patch.object(autoscaler, "MAX_INSTANCES", 5):
+                with patch.object(autoscaler, "BREACH_THRESHOLD", 0):
+                    with pytest.raises(SystemExit):
+                        validate_config()
 
 
 if __name__ == "__main__":

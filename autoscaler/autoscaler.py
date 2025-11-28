@@ -11,7 +11,7 @@ import logging
 import os
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import requests
 
@@ -48,21 +48,62 @@ SCALE_DOWN_COOLDOWN = int(os.environ.get("SCALE_DOWN_COOLDOWN", "180"))  # secon
 SCALE_UP_THRESHOLD = float(os.environ.get("SCALE_UP_THRESHOLD", "1.5"))
 SCALE_DOWN_THRESHOLD = float(os.environ.get("SCALE_DOWN_THRESHOLD", "0.25"))
 
-# Stabilization window (consecutive readings required)
-STABILIZATION_WINDOW = int(os.environ.get("STABILIZATION_WINDOW", "3"))
+# Step sizes for scaling
+SCALE_UP_STEP = int(os.environ.get("SCALE_UP_STEP", "2"))
+SCALE_DOWN_STEP = int(os.environ.get("SCALE_DOWN_STEP", "1"))
+
+# Stabilization with time decay
+STABILIZATION_WINDOW_MINUTES = int(os.environ.get("STABILIZATION_WINDOW_MINUTES", "3"))
+DECAY_HALF_LIFE_SECONDS = float(os.environ.get("DECAY_HALF_LIFE_SECONDS", "30"))
+BREACH_THRESHOLD = float(os.environ.get("BREACH_THRESHOLD", "2.0"))
 
 GITHUB_API = "https://api.github.com"
 DO_API = "https://api.digitalocean.com/v2"
+
+
+def validate_config() -> None:
+    """Validate configuration on startup. Exits if invalid."""
+    errors = []
+
+    if MIN_INSTANCES > MAX_INSTANCES:
+        errors.append(f"MIN_INSTANCES ({MIN_INSTANCES}) > MAX_INSTANCES ({MAX_INSTANCES})")
+    if MIN_INSTANCES < 0:
+        errors.append("MIN_INSTANCES must be >= 0")
+    if SCALE_UP_COOLDOWN < 0:
+        errors.append("SCALE_UP_COOLDOWN must be >= 0")
+    if SCALE_DOWN_COOLDOWN < 0:
+        errors.append("SCALE_DOWN_COOLDOWN must be >= 0")
+    if POLL_INTERVAL <= 0:
+        errors.append("POLL_INTERVAL must be > 0")
+    if SCALE_UP_STEP < 1:
+        errors.append("SCALE_UP_STEP must be >= 1")
+    if SCALE_DOWN_STEP < 1:
+        errors.append("SCALE_DOWN_STEP must be >= 1")
+    if SCALE_UP_THRESHOLD <= 0:
+        errors.append("SCALE_UP_THRESHOLD must be > 0")
+    if SCALE_DOWN_THRESHOLD < 0:
+        errors.append("SCALE_DOWN_THRESHOLD must be >= 0")
+    if STABILIZATION_WINDOW_MINUTES <= 0:
+        errors.append("STABILIZATION_WINDOW_MINUTES must be > 0")
+    if DECAY_HALF_LIFE_SECONDS <= 0:
+        errors.append("DECAY_HALF_LIFE_SECONDS must be > 0")
+    if BREACH_THRESHOLD <= 0:
+        errors.append("BREACH_THRESHOLD must be > 0")
+
+    if errors:
+        for e in errors:
+            log.error(f"Config error: {e}")
+        sys.exit(1)
 
 
 @dataclass
 class ScalingState:
     """Tracks scaling state for cooldown and stabilization."""
 
-    last_scale_time: float = 0
-    last_scale_direction: str = ""  # "up" or "down"
-    consecutive_scale_up_readings: int = 0
-    consecutive_scale_down_readings: int = 0
+    last_scale_up_time: float = 0
+    last_scale_down_time: float = 0
+    # Time-weighted breach history: (timestamp, direction) where direction is "up" or "down"
+    breach_history: list = field(default_factory=list)
 
 
 def get_queued_jobs() -> int:
@@ -149,8 +190,12 @@ def get_current_instance_count() -> int:
     return 1
 
 
-def scale_worker(desired_count: int) -> None:
-    """Update the worker instance count via DO API."""
+def scale_worker(desired_count: int) -> bool:
+    """Update the worker instance count via DO API.
+
+    Returns:
+        True if the update was successful and verified, False otherwise.
+    """
     headers = {
         "Authorization": f"Bearer {DO_API_TOKEN}",
         "Content-Type": "application/json",
@@ -172,7 +217,7 @@ def scale_worker(desired_count: int) -> None:
 
     if not updated:
         log.error(f"Worker '{WORKER_NAME}' not found")
-        return
+        return False
 
     # Apply updated spec
     resp = requests.put(
@@ -181,7 +226,24 @@ def scale_worker(desired_count: int) -> None:
         json={"spec": spec},
     )
     resp.raise_for_status()
+
+    # Verify the change took effect (handles concurrent modifications)
+    verify_resp = requests.get(f"{DO_API}/apps/{APP_ID}", headers=headers)
+    verify_resp.raise_for_status()
+    actual_count = None
+    for worker in verify_resp.json().get("app", {}).get("spec", {}).get("workers", []):
+        if worker.get("name") == WORKER_NAME:
+            actual_count = worker.get("instance_count")
+            break
+
+    if actual_count != desired_count:
+        log.warning(
+            f"Spec update conflict: expected {desired_count}, got {actual_count}"
+        )
+        return False
+
     log.info(f"Scaled {WORKER_NAME} to {desired_count} instances")
+    return True
 
 
 def should_scale_up(queued: int, current: int) -> bool:
@@ -196,44 +258,80 @@ def should_scale_down(queued: int, current: int) -> bool:
     return queued < threshold
 
 
+def calculate_breach_score(state: ScalingState, direction: str) -> float:
+    """Calculate time-decayed breach score for a direction.
+
+    Uses exponential decay where the weight of each breach halves every
+    DECAY_HALF_LIFE_SECONDS. Recent breaches count more than old ones.
+    """
+    now = time.time()
+    window_start = now - (STABILIZATION_WINDOW_MINUTES * 60)
+
+    # Prune old entries outside the window
+    state.breach_history = [
+        (ts, d) for ts, d in state.breach_history if ts > window_start
+    ]
+
+    score = 0.0
+    for ts, d in state.breach_history:
+        if d == direction:
+            age_seconds = now - ts
+            # Exponential decay: weight halves every DECAY_HALF_LIFE_SECONDS
+            weight = 0.5 ** (age_seconds / DECAY_HALF_LIFE_SECONDS)
+            score += weight
+
+    return score
+
+
+def record_breach(state: ScalingState, direction: str) -> None:
+    """Record a threshold breach for the given direction."""
+    state.breach_history.append((time.time(), direction))
+
+
 def is_cooldown_active(state: ScalingState, direction: str) -> bool:
-    """Check if cooldown period is still active for the given direction."""
-    if state.last_scale_time == 0:
-        return False
+    """Check if cooldown period is still active for the given direction.
 
-    elapsed = time.time() - state.last_scale_time
-
+    Each direction has its own independent cooldown, allowing scale-up
+    during scale-down cooldown and vice versa.
+    """
     if direction == "up":
-        return elapsed < SCALE_UP_COOLDOWN
+        if state.last_scale_up_time == 0:
+            return False
+        return time.time() - state.last_scale_up_time < SCALE_UP_COOLDOWN
     else:  # down
-        return elapsed < SCALE_DOWN_COOLDOWN
+        if state.last_scale_down_time == 0:
+            return False
+        return time.time() - state.last_scale_down_time < SCALE_DOWN_COOLDOWN
 
 
 def evaluate_scaling(
     queued: int, current: int, state: ScalingState
 ) -> tuple[str, int]:
     """
-    Evaluate scaling decision based on thresholds, stabilization, and cooldown.
+    Evaluate scaling decision based on thresholds, time-decay stabilization, and cooldown.
+
+    Uses a time-weighted breach score instead of consecutive counts. Recent threshold
+    breaches count more than older ones via exponential decay.
 
     Returns:
         tuple of (action, new_count) where action is "up", "down", or "none"
     """
     # Check scale-up condition
     if should_scale_up(queued, current):
-        state.consecutive_scale_up_readings += 1
-        state.consecutive_scale_down_readings = 0
+        record_breach(state, "up")
+        score = calculate_breach_score(state, "up")
         log.info(
             f"Scale-up condition met ({queued} > {current * SCALE_UP_THRESHOLD:.1f}), "
-            f"readings: {state.consecutive_scale_up_readings}/{STABILIZATION_WINDOW}"
+            f"breach score: {score:.2f}/{BREACH_THRESHOLD}"
         )
 
-        if state.consecutive_scale_up_readings >= STABILIZATION_WINDOW:
+        if score >= BREACH_THRESHOLD:
             if is_cooldown_active(state, "up"):
-                remaining = SCALE_UP_COOLDOWN - (time.time() - state.last_scale_time)
+                remaining = SCALE_UP_COOLDOWN - (time.time() - state.last_scale_up_time)
                 log.info(f"Scale-up blocked by cooldown ({remaining:.0f}s remaining)")
                 return ("none", current)
 
-            new_count = min(current + 1, MAX_INSTANCES)
+            new_count = min(current + SCALE_UP_STEP, MAX_INSTANCES)
             if new_count > current:
                 return ("up", new_count)
             else:
@@ -241,29 +339,27 @@ def evaluate_scaling(
 
     # Check scale-down condition
     elif should_scale_down(queued, current):
-        state.consecutive_scale_down_readings += 1
-        state.consecutive_scale_up_readings = 0
+        record_breach(state, "down")
+        score = calculate_breach_score(state, "down")
         log.info(
             f"Scale-down condition met ({queued} < {current * SCALE_DOWN_THRESHOLD:.1f}), "
-            f"readings: {state.consecutive_scale_down_readings}/{STABILIZATION_WINDOW}"
+            f"breach score: {score:.2f}/{BREACH_THRESHOLD}"
         )
 
-        if state.consecutive_scale_down_readings >= STABILIZATION_WINDOW:
+        if score >= BREACH_THRESHOLD:
             if is_cooldown_active(state, "down"):
-                remaining = SCALE_DOWN_COOLDOWN - (time.time() - state.last_scale_time)
+                remaining = SCALE_DOWN_COOLDOWN - (time.time() - state.last_scale_down_time)
                 log.info(f"Scale-down blocked by cooldown ({remaining:.0f}s remaining)")
                 return ("none", current)
 
-            new_count = max(current - 1, MIN_INSTANCES)
+            new_count = max(current - SCALE_DOWN_STEP, MIN_INSTANCES)
             if new_count < current:
                 return ("down", new_count)
             else:
                 log.info(f"Already at MIN_INSTANCES ({MIN_INSTANCES})")
 
-    # No scaling condition met - reset counters
+    # No scaling condition met
     else:
-        state.consecutive_scale_up_readings = 0
-        state.consecutive_scale_down_readings = 0
         log.debug("Queue stable (no scaling thresholds met)")
 
     return ("none", current)
@@ -355,11 +451,17 @@ def main():
     log.info(f"  Scale-down threshold: {SCALE_DOWN_THRESHOLD}x capacity")
     log.info(f"  Scale-up cooldown: {SCALE_UP_COOLDOWN}s")
     log.info(f"  Scale-down cooldown: {SCALE_DOWN_COOLDOWN}s")
-    log.info(f"  Stabilization window: {STABILIZATION_WINDOW} readings")
+    log.info(f"  Stabilization window: {STABILIZATION_WINDOW_MINUTES}min")
+    log.info(f"  Decay half-life: {DECAY_HALF_LIFE_SECONDS}s")
+    log.info(f"  Breach threshold: {BREACH_THRESHOLD}")
+    log.info(f"  Scale-up step: +{SCALE_UP_STEP}")
+    log.info(f"  Scale-down step: -{SCALE_DOWN_STEP}")
 
     if not all([GITHUB_TOKEN, DO_API_TOKEN, APP_ID]):
         log.error("GITHUB_TOKEN, DO_API_TOKEN, and APP_ID are required")
         sys.exit(1)
+
+    validate_config()
 
     state = ScalingState()
 
@@ -376,11 +478,15 @@ def main():
             if action != "none":
                 log.info(f"Scaling {WORKER_NAME}: {current} -> {new_count}")
                 scale_worker(new_count)
-                state.last_scale_time = time.time()
-                state.last_scale_direction = action
-                # Reset counters after scaling
-                state.consecutive_scale_up_readings = 0
-                state.consecutive_scale_down_readings = 0
+                # Set cooldown for the direction that was scaled
+                if action == "up":
+                    state.last_scale_up_time = time.time()
+                else:
+                    state.last_scale_down_time = time.time()
+                # Clear breach history for this direction after scaling
+                state.breach_history = [
+                    (ts, d) for ts, d in state.breach_history if d != action
+                ]
             else:
                 log.debug(f"No scaling action ({current} instances)")
 
