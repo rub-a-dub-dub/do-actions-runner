@@ -2,16 +2,17 @@
 """
 GitHub Actions Runner Autoscaler for DigitalOcean App Platform.
 
-Polls GitHub API for job demand (queued + in_progress) and scales runner workers accordingly.
-Includes cooldown periods, hysteresis thresholds, and stabilization windows
-to prevent thrashing.
+Polls GitHub API for queued jobs and runner status, then scales runner workers accordingly.
+Uses ephemeral runners that self-terminate after one job, with safe scale-down
+based on idle runner count.
 """
 
 import logging
 import os
 import sys
 import time
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass
 
 import requests
 
@@ -44,28 +45,15 @@ POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "60"))
 SCALE_UP_COOLDOWN = int(os.environ.get("SCALE_UP_COOLDOWN", "60"))  # seconds
 SCALE_DOWN_COOLDOWN = int(os.environ.get("SCALE_DOWN_COOLDOWN", "180"))  # seconds
 
-# Hysteresis thresholds
-SCALE_UP_THRESHOLD = float(os.environ.get("SCALE_UP_THRESHOLD", "1.5"))
-SCALE_DOWN_THRESHOLD = float(os.environ.get("SCALE_DOWN_THRESHOLD", "0.25"))
-
-# Step sizes for scaling (these are maximums when using proportional scaling)
-SCALE_UP_STEP = int(os.environ.get("SCALE_UP_STEP", "2"))
-SCALE_DOWN_STEP = int(os.environ.get("SCALE_DOWN_STEP", "1"))
-
-# Proportional scaling factors (fraction of deficit/excess to scale by)
-SCALE_UP_PROPORTION = float(os.environ.get("SCALE_UP_PROPORTION", "0.5"))
-SCALE_DOWN_PROPORTION = float(os.environ.get("SCALE_DOWN_PROPORTION", "0.5"))
+# Scale-up configuration
+SCALE_UP_STEP = int(os.environ.get("SCALE_UP_STEP", "2"))  # max instances to add at once
+SCALE_UP_PROPORTION = float(os.environ.get("SCALE_UP_PROPORTION", "0.5"))  # fraction of queued jobs
 
 # Runner filtering
 RUNNER_NAME_PREFIX = os.environ.get("RUNNER_NAME_PREFIX", "")
 
 # Multiple runners per instance
 RUNNERS_PER_INSTANCE = int(os.environ.get("RUNNERS_PER_INSTANCE", "1"))
-
-# Stabilization with time decay
-STABILIZATION_WINDOW_MINUTES = int(os.environ.get("STABILIZATION_WINDOW_MINUTES", "3"))
-DECAY_HALF_LIFE_SECONDS = float(os.environ.get("DECAY_HALF_LIFE_SECONDS", "30"))
-BREACH_THRESHOLD = float(os.environ.get("BREACH_THRESHOLD", "2.0"))
 
 GITHUB_API = "https://api.github.com"
 DO_API = "https://api.digitalocean.com/v2"
@@ -87,22 +75,8 @@ def validate_config() -> None:
         errors.append("POLL_INTERVAL must be > 0")
     if SCALE_UP_STEP < 1:
         errors.append("SCALE_UP_STEP must be >= 1")
-    if SCALE_DOWN_STEP < 1:
-        errors.append("SCALE_DOWN_STEP must be >= 1")
-    if SCALE_UP_THRESHOLD <= 0:
-        errors.append("SCALE_UP_THRESHOLD must be > 0")
-    if SCALE_DOWN_THRESHOLD < 0:
-        errors.append("SCALE_DOWN_THRESHOLD must be >= 0")
-    if STABILIZATION_WINDOW_MINUTES <= 0:
-        errors.append("STABILIZATION_WINDOW_MINUTES must be > 0")
-    if DECAY_HALF_LIFE_SECONDS <= 0:
-        errors.append("DECAY_HALF_LIFE_SECONDS must be > 0")
-    if BREACH_THRESHOLD <= 0:
-        errors.append("BREACH_THRESHOLD must be > 0")
     if not 0 < SCALE_UP_PROPORTION <= 1:
         errors.append("SCALE_UP_PROPORTION must be > 0 and <= 1")
-    if not 0 < SCALE_DOWN_PROPORTION <= 1:
-        errors.append("SCALE_DOWN_PROPORTION must be > 0 and <= 1")
     if RUNNERS_PER_INSTANCE < 1:
         errors.append("RUNNERS_PER_INSTANCE must be >= 1")
 
@@ -136,62 +110,48 @@ def is_our_runner(runner_name: str | None) -> bool:
 
 @dataclass
 class ScalingState:
-    """Tracks scaling state for cooldown and stabilization."""
+    """Tracks scaling state for cooldown periods."""
 
     last_scale_up_time: float = 0
     last_scale_down_time: float = 0
-    # Time-weighted breach history: (timestamp, direction) where direction is "up" or "down"
-    breach_history: list = field(default_factory=list)
 
 
-def get_job_demand() -> int:
-    """Get count of jobs needing runner capacity from GitHub.
+def get_queued_job_count() -> int:
+    """Get count of queued jobs targeting self-hosted runners.
 
-    This counts both queued (waiting for a runner) and in_progress (currently
-    running) jobs. We include in_progress because those jobs are actively using
-    runner capacity and shouldn't trigger scale-down.
+    Only counts queued jobs (not in_progress). Ephemeral runners handle
+    in_progress jobs themselves - they exit after completion.
 
     Returns:
-        Total job demand (queued + in_progress).
+        Number of queued jobs waiting for runners.
     """
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github.v3+json",
     }
 
-    # First, get runs that are queued or in_progress (jobs may be waiting)
+    # Get runs that are queued (jobs may be waiting for runners)
     if ORG:
         runs_url = f"{GITHUB_API}/orgs/{ORG}/actions/runs?status=queued&per_page=100"
-        in_progress_url = f"{GITHUB_API}/orgs/{ORG}/actions/runs?status=in_progress&per_page=100"
     elif OWNER and REPO:
         runs_url = f"{GITHUB_API}/repos/{OWNER}/{REPO}/actions/runs?status=queued&per_page=100"
-        in_progress_url = f"{GITHUB_API}/repos/{OWNER}/{REPO}/actions/runs?status=in_progress&per_page=100"
     else:
         log.error("ORG or (OWNER and REPO) must be set")
         sys.exit(1)
 
-    # Collect all runs that might have active jobs
-    all_runs = []
-
     resp = requests.get(runs_url, headers=headers)
     resp.raise_for_status()
-    all_runs.extend(resp.json().get("workflow_runs", []))
+    queued_runs = resp.json().get("workflow_runs", [])
 
-    resp = requests.get(in_progress_url, headers=headers)
-    resp.raise_for_status()
-    all_runs.extend(resp.json().get("workflow_runs", []))
-
-    # Count queued and in_progress jobs across all runs
+    # Count queued jobs across all runs
     queued_count = 0
-    in_progress_count = 0
-    for run in all_runs:
+    for run in queued_runs:
         run_id = run.get("id")
         if not run_id:
             continue
 
         # Get jobs for this run
         if ORG:
-            # For org-level, we need the repo info from the run
             repo_full_name = run.get("repository", {}).get("full_name", "")
             if not repo_full_name:
                 continue
@@ -205,23 +165,13 @@ def get_job_demand() -> int:
             jobs = jobs_resp.json().get("jobs", [])
 
             for job in jobs:
-                status = job.get("status")
-                runner_name = job.get("runner_name")
-
-                if status == "queued":
-                    # Count queued jobs targeting self-hosted runners
-                    if is_self_hosted_job(job):
-                        queued_count += 1
-                elif status == "in_progress":
-                    # Count in_progress jobs only if targeting self-hosted AND on our runners
-                    if is_self_hosted_job(job) and is_our_runner(runner_name):
-                        in_progress_count += 1
+                if job.get("status") == "queued" and is_self_hosted_job(job):
+                    queued_count += 1
         except requests.RequestException as e:
             log.warning(f"Failed to get jobs for run {run_id}: {e}")
 
-    total_demand = queued_count + in_progress_count
-    log.info(f"Job demand: {total_demand} (queued={queued_count}, in_progress={in_progress_count})")
-    return total_demand
+    log.info(f"Queued jobs: {queued_count}")
+    return queued_count
 
 
 def get_current_instance_count() -> int:
@@ -300,58 +250,6 @@ def scale_worker(desired_count: int) -> bool:
     return True
 
 
-def should_scale_up(demand: int, capacity: int) -> bool:
-    """Check if scale-up threshold is met.
-
-    Args:
-        demand: Total job demand (queued + in_progress jobs).
-        capacity: Total runner capacity (instances × RUNNERS_PER_INSTANCE).
-    """
-    threshold = capacity * SCALE_UP_THRESHOLD
-    return demand > threshold
-
-
-def should_scale_down(demand: int, capacity: int) -> bool:
-    """Check if scale-down threshold is met.
-
-    Args:
-        demand: Total job demand (queued + in_progress jobs).
-        capacity: Total runner capacity (instances × RUNNERS_PER_INSTANCE).
-    """
-    threshold = capacity * SCALE_DOWN_THRESHOLD
-    return demand < threshold
-
-
-def calculate_breach_score(state: ScalingState, direction: str) -> float:
-    """Calculate time-decayed breach score for a direction.
-
-    Uses exponential decay where the weight of each breach halves every
-    DECAY_HALF_LIFE_SECONDS. Recent breaches count more than old ones.
-    """
-    now = time.time()
-    window_start = now - (STABILIZATION_WINDOW_MINUTES * 60)
-
-    # Prune old entries outside the window
-    state.breach_history = [
-        (ts, d) for ts, d in state.breach_history if ts > window_start
-    ]
-
-    score = 0.0
-    for ts, d in state.breach_history:
-        if d == direction:
-            age_seconds = now - ts
-            # Exponential decay: weight halves every DECAY_HALF_LIFE_SECONDS
-            weight = 0.5 ** (age_seconds / DECAY_HALF_LIFE_SECONDS)
-            score += weight
-
-    return score
-
-
-def record_breach(state: ScalingState, direction: str) -> None:
-    """Record a threshold breach for the given direction."""
-    state.breach_history.append((time.time(), direction))
-
-
 def is_cooldown_active(state: ScalingState, direction: str) -> bool:
     """Check if cooldown period is still active for the given direction.
 
@@ -369,93 +267,91 @@ def is_cooldown_active(state: ScalingState, direction: str) -> bool:
 
 
 def evaluate_scaling(
-    demand: int, current: int, state: ScalingState
+    queued_jobs: int,
+    current: int,
+    online_runners: int,
+    idle_runners: int,
+    state: ScalingState,
 ) -> tuple[str, int]:
     """
-    Evaluate scaling decision based on thresholds, time-decay stabilization, and cooldown.
+    Evaluate scaling decision based on queued jobs and runner capacity.
 
-    Uses a time-weighted breach score instead of consecutive counts. Recent threshold
-    breaches count more than older ones via exponential decay.
+    Simplified logic for ephemeral runners:
+    1. Maintain minimum capacity (bypass cooldown)
+    2. Scale up when queued_jobs > 0
+    3. Scale down when idle_runners > min_runners (safe - busy runners not counted)
 
     Args:
-        demand: Total job demand (queued + in_progress jobs).
+        queued_jobs: Number of jobs waiting for runners.
         current: Current instance count.
-        state: Scaling state for cooldowns and breach history.
+        online_runners: Number of online runners (busy + idle).
+        idle_runners: Number of online runners that are NOT busy (safe to terminate).
+        state: Scaling state for cooldowns.
 
     Returns:
         tuple of (action, new_count) where action is "up", "down", or "none"
     """
-    # Calculate total runner capacity
-    capacity = current * RUNNERS_PER_INSTANCE
+    min_runners = MIN_INSTANCES * RUNNERS_PER_INSTANCE
 
-    # Check scale-up condition
-    if should_scale_up(demand, capacity):
-        record_breach(state, "up")
-        score = calculate_breach_score(state, "up")
+    # Priority 1: Maintain minimum capacity (bypass cooldown)
+    if online_runners < min_runners and current < MAX_INSTANCES:
+        runners_needed = min_runners - online_runners
+        instances_to_add = math.ceil(runners_needed / RUNNERS_PER_INSTANCE)
+        new_count = min(current + instances_to_add, MAX_INSTANCES)
         log.info(
-            f"Scale-up condition met (demand {demand} > {capacity * SCALE_UP_THRESHOLD:.1f}), "
-            f"breach score: {score:.2f}/{BREACH_THRESHOLD}"
+            f"Below min capacity: {online_runners} online < {min_runners} min, "
+            f"adding {instances_to_add} instance(s)"
         )
+        return ("up", new_count)
 
-        if score >= BREACH_THRESHOLD:
-            if is_cooldown_active(state, "up"):
-                remaining = SCALE_UP_COOLDOWN - (time.time() - state.last_scale_up_time)
-                log.info(f"Scale-up blocked by cooldown ({remaining:.0f}s remaining)")
-                return ("none", current)
+    # Priority 2: Scale up for queued jobs (no threshold, just queued > 0)
+    if queued_jobs > 0 and current < MAX_INSTANCES:
+        if is_cooldown_active(state, "up"):
+            remaining = SCALE_UP_COOLDOWN - (time.time() - state.last_scale_up_time)
+            log.info(f"Scale-up blocked by cooldown ({remaining:.0f}s remaining)")
+            return ("none", current)
 
-            # Proportional scaling: scale by fraction of runner deficit, converted to instances
-            runner_deficit = demand - capacity
-            # Convert runner deficit to instance step (at least 1 instance, at most SCALE_UP_STEP)
-            instance_step = min(
-                max(int((runner_deficit * SCALE_UP_PROPORTION) / RUNNERS_PER_INSTANCE + 0.5), 1),
-                SCALE_UP_STEP
-            )
-            new_count = min(current + instance_step, MAX_INSTANCES)
-            log.info(
-                f"Scale-up step: {instance_step} instances "
-                f"(runner_deficit={runner_deficit}, proportion={SCALE_UP_PROPORTION})"
-            )
-            if new_count > current:
-                return ("up", new_count)
-            else:
-                log.info(f"Already at MAX_INSTANCES ({MAX_INSTANCES})")
-
-    # Check scale-down condition
-    elif should_scale_down(demand, capacity):
-        record_breach(state, "down")
-        score = calculate_breach_score(state, "down")
+        # Proportional scaling based on queued jobs
+        instances_to_add = min(
+            math.ceil(queued_jobs / RUNNERS_PER_INSTANCE * SCALE_UP_PROPORTION),
+            SCALE_UP_STEP,
+        )
+        instances_to_add = max(instances_to_add, 1)  # At least 1
+        new_count = min(current + instances_to_add, MAX_INSTANCES)
         log.info(
-            f"Scale-down condition met (demand {demand} < {capacity * SCALE_DOWN_THRESHOLD:.1f}), "
-            f"breach score: {score:.2f}/{BREACH_THRESHOLD}"
+            f"Scaling up for {queued_jobs} queued job(s): "
+            f"+{instances_to_add} instance(s) -> {new_count}"
         )
+        if new_count > current:
+            return ("up", new_count)
+        else:
+            log.info(f"Already at MAX_INSTANCES ({MAX_INSTANCES})")
 
-        if score >= BREACH_THRESHOLD:
-            if is_cooldown_active(state, "down"):
-                remaining = SCALE_DOWN_COOLDOWN - (time.time() - state.last_scale_down_time)
-                log.info(f"Scale-down blocked by cooldown ({remaining:.0f}s remaining)")
-                return ("none", current)
+    # Priority 3: Scale down when we have excess IDLE runners AND no queued work
+    # Use idle_runners (not online) to avoid terminating busy runners
+    # Don't scale down if jobs are queued - runners will pick them up soon
+    if queued_jobs == 0 and idle_runners > min_runners and current > MIN_INSTANCES:
+        if is_cooldown_active(state, "down"):
+            remaining = SCALE_DOWN_COOLDOWN - (time.time() - state.last_scale_down_time)
+            log.info(f"Scale-down blocked by cooldown ({remaining:.0f}s remaining)")
+            return ("none", current)
 
-            # Proportional scaling: scale by fraction of runner excess, converted to instances
-            runner_excess = capacity - demand
-            # Convert runner excess to instance step (at least 1 instance, at most SCALE_DOWN_STEP)
-            instance_step = min(
-                max(int((runner_excess * SCALE_DOWN_PROPORTION) / RUNNERS_PER_INSTANCE), 1),
-                SCALE_DOWN_STEP
-            )
-            new_count = max(current - instance_step, MIN_INSTANCES)
-            log.info(
-                f"Scale-down step: {instance_step} instances "
-                f"(runner_excess={runner_excess}, proportion={SCALE_DOWN_PROPORTION})"
-            )
-            if new_count < current:
-                return ("down", new_count)
-            else:
-                log.info(f"Already at MIN_INSTANCES ({MIN_INSTANCES})")
+        # Conservative: scale down by 1 instance at a time
+        new_count = max(current - 1, MIN_INSTANCES)
+        log.info(
+            f"Scaling down: {idle_runners} idle > {min_runners} min, "
+            f"-1 instance -> {new_count}"
+        )
+        if new_count < current:
+            return ("down", new_count)
+        else:
+            log.info(f"Already at MIN_INSTANCES ({MIN_INSTANCES})")
 
-    # No scaling condition met
-    else:
-        log.debug("Demand stable (no scaling thresholds met)")
-
+    # No scaling needed
+    log.debug(
+        f"Stable: queued={queued_jobs}, online={online_runners}, "
+        f"idle={idle_runners}, instances={current}"
+    )
     return ("none", current)
 
 
@@ -478,6 +374,48 @@ def get_runners() -> list[dict]:
     data = resp.json()
 
     return data.get("runners", [])
+
+
+def get_online_runner_count() -> int:
+    """Count currently online runners matching our prefix.
+
+    Returns:
+        Number of online runners (both busy and idle).
+    """
+    try:
+        runners = get_runners()
+    except requests.RequestException as e:
+        log.error(f"Failed to get runners: {e}")
+        return 0
+
+    count = sum(
+        1
+        for r in runners
+        if r.get("status") == "online" and is_our_runner(r.get("name"))
+    )
+    return count
+
+
+def get_idle_runner_count() -> int:
+    """Count online runners that are NOT busy (safe to terminate).
+
+    Returns:
+        Number of idle runners that could be safely terminated.
+    """
+    try:
+        runners = get_runners()
+    except requests.RequestException as e:
+        log.error(f"Failed to get runners: {e}")
+        return 0
+
+    count = sum(
+        1
+        for r in runners
+        if r.get("status") == "online"
+        and not r.get("busy", False)
+        and is_our_runner(r.get("name"))
+    )
+    return count
 
 
 def delete_runner(runner_id: int) -> bool:
@@ -536,22 +474,15 @@ def cleanup_dead_runners() -> int:
 
 def main():
     """Main autoscaler loop (runs continuously)."""
-    log.info("Starting GitHub Actions Runner Autoscaler")
+    log.info("Starting GitHub Actions Runner Autoscaler (ephemeral mode)")
     log.info(f"  Worker: {WORKER_NAME}")
     log.info(f"  Min instances: {MIN_INSTANCES}")
     log.info(f"  Max instances: {MAX_INSTANCES}")
     log.info(f"  Poll interval: {POLL_INTERVAL}s")
-    log.info(f"  Scale-up threshold: {SCALE_UP_THRESHOLD}x capacity")
-    log.info(f"  Scale-down threshold: {SCALE_DOWN_THRESHOLD}x capacity")
     log.info(f"  Scale-up cooldown: {SCALE_UP_COOLDOWN}s")
     log.info(f"  Scale-down cooldown: {SCALE_DOWN_COOLDOWN}s")
-    log.info(f"  Stabilization window: {STABILIZATION_WINDOW_MINUTES}min")
-    log.info(f"  Decay half-life: {DECAY_HALF_LIFE_SECONDS}s")
-    log.info(f"  Breach threshold: {BREACH_THRESHOLD}")
     log.info(f"  Scale-up step: +{SCALE_UP_STEP} (max)")
-    log.info(f"  Scale-down step: -{SCALE_DOWN_STEP} (max)")
     log.info(f"  Scale-up proportion: {SCALE_UP_PROPORTION}")
-    log.info(f"  Scale-down proportion: {SCALE_DOWN_PROPORTION}")
     log.info(f"  Runner name prefix: '{RUNNER_NAME_PREFIX}' (empty=all self-hosted)")
     log.info(f"  Runners per instance: {RUNNERS_PER_INSTANCE}")
 
@@ -568,10 +499,20 @@ def main():
             # Clean up any dead runners first
             cleanup_dead_runners()
 
-            demand = get_job_demand()
+            # Gather metrics
+            queued_jobs = get_queued_job_count()
             current = get_current_instance_count()
+            online_runners = get_online_runner_count()
+            idle_runners = get_idle_runner_count()
 
-            action, new_count = evaluate_scaling(demand, current, state)
+            log.info(
+                f"Status: instances={current}, online={online_runners}, "
+                f"idle={idle_runners}, queued={queued_jobs}"
+            )
+
+            action, new_count = evaluate_scaling(
+                queued_jobs, current, online_runners, idle_runners, state
+            )
 
             if action != "none":
                 log.info(f"Scaling {WORKER_NAME}: {current} -> {new_count}")
@@ -581,10 +522,6 @@ def main():
                     state.last_scale_up_time = time.time()
                 else:
                     state.last_scale_down_time = time.time()
-                # Clear breach history for this direction after scaling
-                state.breach_history = [
-                    (ts, d) for ts, d in state.breach_history if d != action
-                ]
             else:
                 log.debug(f"No scaling action ({current} instances)")
 

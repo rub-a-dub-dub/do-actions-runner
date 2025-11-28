@@ -35,10 +35,10 @@ fi
 RUNNER_TOKEN=$(curl -s -X POST -H "authorization: token ${TOKEN}" "https://api.github.com/${API_PATH}/actions/runners/registration-token" | jq -r .token)
 
 cleanup() {
-  echo "Cleaning up ${#RUNNER_DIRS[@]} runner(s)..."
-  for dir in "${RUNNER_DIRS[@]}"; do
-    echo "Deregistering runner in ${dir}..."
-    (cd "$dir" && ./config.sh remove --token "${RUNNER_TOKEN}") || true
+  echo "Shutting down ${#RUNNER_PIDS[@]} ephemeral runner(s)..."
+  # Ephemeral runners auto-deregister on exit, just signal them to stop
+  for pid in "${RUNNER_PIDS[@]}"; do
+    kill -TERM "$pid" 2>/dev/null || true
   done
 }
 
@@ -62,13 +62,14 @@ for i in $(seq 1 $RUNNERS_PER_INSTANCE); do
     fi
   fi
 
-  # Configure runner
+  # Configure runner (ephemeral: exit after one job)
   echo "Configuring runner ${i}: ${RUNNER_NAME}"
   (cd "$RUNNER_DIR" && ./config.sh \
     --url "https://github.com/${CONFIG_PATH}" \
     --token "${RUNNER_TOKEN}" \
     --name "${RUNNER_NAME}" \
-    --unattended)
+    --unattended \
+    --ephemeral)
 
   # Start runner in background
   (cd "$RUNNER_DIR" && ./run.sh "$@") &
