@@ -119,6 +119,58 @@ class TestBreachScore:
         assert state.breach_history[0][1] == "up"
 
 
+class TestJobFiltering:
+    """Tests for job filtering functions."""
+
+    def test_is_self_hosted_job_with_self_hosted_label(self):
+        """Should return True when job has self-hosted label."""
+        job = {"labels": ["self-hosted", "linux", "x64"]}
+        assert autoscaler.is_self_hosted_job(job) is True
+
+    def test_is_self_hosted_job_without_self_hosted_label(self):
+        """Should return False when job doesn't have self-hosted label."""
+        job = {"labels": ["ubuntu-latest"]}
+        assert autoscaler.is_self_hosted_job(job) is False
+
+    def test_is_self_hosted_job_with_empty_labels(self):
+        """Should return False when job has empty labels."""
+        job = {"labels": []}
+        assert autoscaler.is_self_hosted_job(job) is False
+
+    def test_is_self_hosted_job_with_no_labels(self):
+        """Should return False when job has no labels key."""
+        job = {}
+        assert autoscaler.is_self_hosted_job(job) is False
+
+    def test_is_our_runner_with_matching_prefix(self):
+        """Should return True when runner name matches prefix."""
+        with patch.object(autoscaler, "RUNNER_NAME_PREFIX", "runner-"):
+            assert autoscaler.is_our_runner("runner-abc123") is True
+            assert autoscaler.is_our_runner("runner-") is True
+
+    def test_is_our_runner_with_non_matching_prefix(self):
+        """Should return False when runner name doesn't match prefix."""
+        with patch.object(autoscaler, "RUNNER_NAME_PREFIX", "runner-"):
+            assert autoscaler.is_our_runner("other-abc123") is False
+            assert autoscaler.is_our_runner("RUNNER-abc123") is False  # Case sensitive
+
+    def test_is_our_runner_with_empty_prefix(self):
+        """Should return True for any runner when prefix is empty."""
+        with patch.object(autoscaler, "RUNNER_NAME_PREFIX", ""):
+            assert autoscaler.is_our_runner("any-runner-name") is True
+            assert autoscaler.is_our_runner("runner-abc123") is True
+
+    def test_is_our_runner_with_none_runner_name(self):
+        """Should return False when runner_name is None."""
+        with patch.object(autoscaler, "RUNNER_NAME_PREFIX", "runner-"):
+            assert autoscaler.is_our_runner(None) is False
+
+    def test_is_our_runner_with_empty_runner_name(self):
+        """Should return False when runner_name is empty string."""
+        with patch.object(autoscaler, "RUNNER_NAME_PREFIX", "runner-"):
+            assert autoscaler.is_our_runner("") is False
+
+
 class TestThresholds:
     """Tests for threshold functions."""
 
@@ -450,35 +502,35 @@ class TestGetJobDemand:
     """Tests for get_job_demand function."""
 
     @patch("autoscaler.requests.get")
-    def test_counts_queued_and_in_progress_jobs(self, mock_get):
-        """Should count both queued and in_progress jobs (total demand)."""
+    def test_counts_only_self_hosted_queued_and_our_in_progress(self, mock_get):
+        """Should count queued self-hosted jobs and in_progress jobs on our runners."""
         # Mock responses for runs (queued), runs (in_progress), and jobs
         def mock_get_side_effect(url, headers=None):
             mock_resp = MagicMock()
             if "status=queued" in url and "actions/runs" in url:
-                # One queued run
                 mock_resp.json.return_value = {
                     "workflow_runs": [{"id": 123}]
                 }
             elif "status=in_progress" in url and "actions/runs" in url:
-                # One in-progress run
                 mock_resp.json.return_value = {
                     "workflow_runs": [{"id": 456}]
                 }
             elif "runs/123/jobs" in url:
-                # Run 123 has 2 queued jobs
+                # Run 123 has 2 queued self-hosted jobs and 1 queued github-hosted job
                 mock_resp.json.return_value = {
                     "jobs": [
-                        {"status": "queued"},
-                        {"status": "queued"},
+                        {"status": "queued", "labels": ["self-hosted", "linux"]},
+                        {"status": "queued", "labels": ["self-hosted", "x64"]},
+                        {"status": "queued", "labels": ["ubuntu-latest"]},  # GitHub-hosted
                     ]
                 }
             elif "runs/456/jobs" in url:
-                # Run 456 has 1 queued job and 1 in_progress
+                # Run 456 has 1 queued self-hosted, 1 in_progress on our runner, 1 in_progress elsewhere
                 mock_resp.json.return_value = {
                     "jobs": [
-                        {"status": "queued"},
-                        {"status": "in_progress"},
+                        {"status": "queued", "labels": ["self-hosted"]},
+                        {"status": "in_progress", "labels": ["self-hosted"], "runner_name": "runner-abc123"},
+                        {"status": "in_progress", "labels": ["self-hosted"], "runner_name": "other-xyz789"},
                     ]
                 }
             else:
@@ -490,10 +542,46 @@ class TestGetJobDemand:
         with patch.object(autoscaler, "ORG", None):
             with patch.object(autoscaler, "OWNER", "test-owner"):
                 with patch.object(autoscaler, "REPO", "test-repo"):
-                    result = autoscaler.get_job_demand()
+                    with patch.object(autoscaler, "RUNNER_NAME_PREFIX", "runner-"):
+                        result = autoscaler.get_job_demand()
 
-        # 2 queued from run 123 + 1 queued from run 456 + 1 in_progress from run 456 = 4
+        # 2 self-hosted queued from run 123 + 1 self-hosted queued from run 456
+        # + 1 in_progress on "runner-abc123" (matches prefix) = 4
+        # (the ubuntu-latest queued and "other-xyz789" in_progress are excluded)
         assert result == 4
+
+    @patch("autoscaler.requests.get")
+    def test_counts_all_in_progress_when_no_prefix(self, mock_get):
+        """Should count all self-hosted in_progress jobs when no prefix configured."""
+        def mock_get_side_effect(url, headers=None):
+            mock_resp = MagicMock()
+            if "status=queued" in url and "actions/runs" in url:
+                mock_resp.json.return_value = {"workflow_runs": []}
+            elif "status=in_progress" in url and "actions/runs" in url:
+                mock_resp.json.return_value = {
+                    "workflow_runs": [{"id": 456}]
+                }
+            elif "runs/456/jobs" in url:
+                mock_resp.json.return_value = {
+                    "jobs": [
+                        {"status": "in_progress", "labels": ["self-hosted"], "runner_name": "runner-abc"},
+                        {"status": "in_progress", "labels": ["self-hosted"], "runner_name": "other-xyz"},
+                    ]
+                }
+            else:
+                mock_resp.json.return_value = {}
+            return mock_resp
+
+        mock_get.side_effect = mock_get_side_effect
+
+        with patch.object(autoscaler, "ORG", None):
+            with patch.object(autoscaler, "OWNER", "test-owner"):
+                with patch.object(autoscaler, "REPO", "test-repo"):
+                    with patch.object(autoscaler, "RUNNER_NAME_PREFIX", ""):
+                        result = autoscaler.get_job_demand()
+
+        # Both in_progress jobs counted (no prefix filtering)
+        assert result == 2
 
     @patch("autoscaler.requests.get")
     def test_org_level_api_call(self, mock_get):
@@ -511,7 +599,7 @@ class TestGetJobDemand:
                     mock_resp.json.return_value = {"workflow_runs": []}
             elif "runs/789/jobs" in url:
                 mock_resp.json.return_value = {
-                    "jobs": [{"status": "queued"}]
+                    "jobs": [{"status": "queued", "labels": ["self-hosted", "linux"]}]
                 }
             else:
                 mock_resp.json.return_value = {}
@@ -520,7 +608,8 @@ class TestGetJobDemand:
         mock_get.side_effect = mock_get_side_effect
 
         with patch.object(autoscaler, "ORG", "test-org"):
-            result = autoscaler.get_job_demand()
+            with patch.object(autoscaler, "RUNNER_NAME_PREFIX", ""):
+                result = autoscaler.get_job_demand()
 
         assert result == 1
         # Verify org-level runs API was called

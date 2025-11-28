@@ -38,7 +38,16 @@ The autoscaler automatically adjusts the number of runner instances based on Git
                     └─────────────────────┘
 ```
 
-**Job Demand** = queued jobs + in_progress jobs. This prevents scaling down while jobs are still running.
+**Job Demand** = filtered queued jobs + filtered in_progress jobs. This prevents scaling down while jobs are still running.
+
+### Job Filtering
+
+Not all jobs in your org/repo are relevant to this runner group. The autoscaler filters jobs:
+
+- **Queued jobs**: Only counts jobs with `self-hosted` in their labels (jobs targeting self-hosted runners)
+- **In-progress jobs**: Only counts jobs where `runner_name` matches `RUNNER_NAME_PREFIX`
+
+This prevents the autoscaler from scaling based on GitHub-hosted runner jobs or jobs running on other self-hosted runner groups.
 
 ## Anti-Thrashing Mechanisms
 
@@ -129,6 +138,7 @@ This handles runners that crashed without deregistering.
 | `REPO` | for repo | Repository name |
 | `ORG` | for org | Organization name |
 | `WORKER_NAME` | `runner` | Name of worker component to scale |
+| `RUNNER_NAME_PREFIX` | `""` | Prefix to match runner names (empty = count all self-hosted) |
 | `MIN_INSTANCES` | `1` | Minimum instance count (DO App Platform requires >= 1) |
 | `MAX_INSTANCES` | `5` | Maximum instance count |
 | `POLL_INTERVAL` | `60` | Seconds between polls |
@@ -196,3 +206,7 @@ docker build -t autoscaler -f autoscaler/Dockerfile .
 docker run -e GITHUB_TOKEN=... -e DO_API_TOKEN=... -e APP_ID=... \
            -e OWNER=... -e REPO=... autoscaler
 ```
+
+## Known Limitations
+
+- **Multiple runner apps**: If you run multiple self-hosted runner deployments (each with their own autoscaler), they may over-scale when counting queued jobs. Queued jobs use the `self-hosted` label for filtering, which doesn't distinguish between different runner groups. Each autoscaler will count all queued self-hosted jobs, potentially causing all groups to scale up for the same jobs. Consider using custom labels and updating the filtering logic if you need multiple isolated runner pools.

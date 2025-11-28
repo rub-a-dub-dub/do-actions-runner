@@ -56,6 +56,9 @@ SCALE_DOWN_STEP = int(os.environ.get("SCALE_DOWN_STEP", "1"))
 SCALE_UP_PROPORTION = float(os.environ.get("SCALE_UP_PROPORTION", "0.5"))
 SCALE_DOWN_PROPORTION = float(os.environ.get("SCALE_DOWN_PROPORTION", "0.5"))
 
+# Runner filtering
+RUNNER_NAME_PREFIX = os.environ.get("RUNNER_NAME_PREFIX", "")
+
 # Stabilization with time decay
 STABILIZATION_WINDOW_MINUTES = int(os.environ.get("STABILIZATION_WINDOW_MINUTES", "3"))
 DECAY_HALF_LIFE_SECONDS = float(os.environ.get("DECAY_HALF_LIFE_SECONDS", "30"))
@@ -102,6 +105,28 @@ def validate_config() -> None:
         for e in errors:
             log.error(f"Config error: {e}")
         sys.exit(1)
+
+
+def is_self_hosted_job(job: dict) -> bool:
+    """Check if job targets self-hosted runners."""
+    labels = job.get("labels", [])
+    return "self-hosted" in labels
+
+
+def is_our_runner(runner_name: str | None) -> bool:
+    """Check if runner_name matches our runner naming pattern.
+
+    Args:
+        runner_name: The name of the runner executing the job.
+
+    Returns:
+        True if the runner matches our prefix pattern (or no prefix is configured).
+    """
+    if not runner_name:
+        return False
+    if not RUNNER_NAME_PREFIX:
+        return True  # No prefix configured, count all self-hosted in_progress jobs
+    return runner_name.startswith(RUNNER_NAME_PREFIX)
 
 
 @dataclass
@@ -176,10 +201,16 @@ def get_job_demand() -> int:
 
             for job in jobs:
                 status = job.get("status")
+                runner_name = job.get("runner_name")
+
                 if status == "queued":
-                    queued_count += 1
+                    # Count queued jobs targeting self-hosted runners
+                    if is_self_hosted_job(job):
+                        queued_count += 1
                 elif status == "in_progress":
-                    in_progress_count += 1
+                    # Count in_progress jobs only if on our runners
+                    if is_our_runner(runner_name):
+                        in_progress_count += 1
         except requests.RequestException as e:
             log.warning(f"Failed to get jobs for run {run_id}: {e}")
 
@@ -488,6 +519,7 @@ def main():
     log.info(f"  Scale-down step: -{SCALE_DOWN_STEP} (max)")
     log.info(f"  Scale-up proportion: {SCALE_UP_PROPORTION}")
     log.info(f"  Scale-down proportion: {SCALE_DOWN_PROPORTION}")
+    log.info(f"  Runner name prefix: '{RUNNER_NAME_PREFIX}' (empty=all self-hosted)")
 
     if not all([GITHUB_TOKEN, DO_API_TOKEN, APP_ID]):
         log.error("GITHUB_TOKEN, DO_API_TOKEN, and APP_ID are required")
