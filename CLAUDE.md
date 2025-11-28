@@ -18,8 +18,11 @@ Self-hosted GitHub Actions runner for DigitalOcean App Platform with auto-regist
 ```bash
 docker build -t do-actions-runner .
 
-# Repository-level
+# Single repository
 docker run -e TOKEN=<pat> -e OWNER=<owner> -e REPO=<repo> do-actions-runner
+
+# Multiple repositories (same owner)
+docker run -e TOKEN=<pat> -e OWNER=<owner> -e REPOS=repo1,repo2,repo3 do-actions-runner
 
 # Organization-level
 docker run -e TOKEN=<pat> -e ORG=<org> do-actions-runner
@@ -31,10 +34,11 @@ docker run -e TOKEN=<pat> -e ORG=<org> do-actions-runner
 |----------|----------|-------------|
 | `TOKEN` | Yes | GitHub PAT (`repo` or `admin:org` scope) |
 | `OWNER` | For repo | Repository owner |
-| `REPO` | For repo | Repository name |
+| `REPO` | For repo | Single repository name |
+| `REPOS` | For repo | Comma-separated repository names (same owner) |
 | `ORG` | For org | Organization name |
-| `NAME` | No | Custom runner name (default: hostname) |
-| `RUNNERS_PER_INSTANCE` | No | Number of runner processes per container (default: 1) |
+| `NAME` | No | Custom runner name prefix (default: hostname) |
+| `RUNNERS_PER_INSTANCE` | No | Number of runner processes per repo per container (default: 1) |
 
 ## Guidelines for AI Agents
 
@@ -65,8 +69,8 @@ log.exception("Crash details")          # Errors with stack trace
 ```
 
 ### Testing Changes
-- Test both repo-level and org-level configurations
-- Verify runner appears in GitHub Settings > Actions > Runners
+- Test single repo, multi-repo (REPOS), and org-level configurations
+- Verify runners appear in GitHub Settings > Actions > Runners for each repo
 - Test graceful shutdown confirms deregistration
 
 See `docs/` for detailed documentation.

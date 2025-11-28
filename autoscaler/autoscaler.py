@@ -34,6 +34,15 @@ APP_ID = os.environ.get("APP_ID")
 ORG = os.environ.get("ORG")
 OWNER = os.environ.get("OWNER")
 REPO = os.environ.get("REPO")
+REPOS = os.environ.get("REPOS")  # Comma-separated list of repos (same owner)
+
+# Build REPO_LIST from REPOS or single REPO
+REPO_LIST: list[str] = []
+if not ORG:
+    if REPOS:
+        REPO_LIST = [r.strip() for r in REPOS.split(",") if r.strip()]
+    elif REPO:
+        REPO_LIST = [REPO]
 
 # Scaling configuration
 WORKER_NAME = os.environ.get("WORKER_NAME", "runner")
@@ -133,8 +142,8 @@ def get_queued_job_count() -> int:
         "Accept": "application/vnd.github.v3+json",
     }
 
-    if not ORG and not (OWNER and REPO):
-        log.error("ORG or (OWNER and REPO) must be set")
+    if not ORG and not (OWNER and REPO_LIST):
+        log.error("ORG or (OWNER and REPOS/REPO) must be set")
         sys.exit(1)
 
     # Query both queued AND in_progress runs
@@ -142,16 +151,21 @@ def get_queued_job_count() -> int:
     all_runs = []
     for run_status in ["queued", "in_progress"]:
         if ORG:
-            runs_url = f"{GITHUB_API}/orgs/{ORG}/actions/runs?status={run_status}&per_page=100"
+            urls = [f"{GITHUB_API}/orgs/{ORG}/actions/runs?status={run_status}&per_page=100"]
         else:
-            runs_url = f"{GITHUB_API}/repos/{OWNER}/{REPO}/actions/runs?status={run_status}&per_page=100"
+            # Query each repo
+            urls = [
+                f"{GITHUB_API}/repos/{OWNER}/{repo}/actions/runs?status={run_status}&per_page=100"
+                for repo in REPO_LIST
+            ]
 
-        try:
-            resp = requests.get(runs_url, headers=headers)
-            resp.raise_for_status()
-            all_runs.extend(resp.json().get("workflow_runs", []))
-        except requests.RequestException as e:
-            log.warning(f"Failed to get {run_status} runs: {e}")
+        for runs_url in urls:
+            try:
+                resp = requests.get(runs_url, headers=headers)
+                resp.raise_for_status()
+                all_runs.extend(resp.json().get("workflow_runs", []))
+            except requests.RequestException as e:
+                log.warning(f"Failed to get {run_status} runs from {runs_url}: {e}")
 
     # Deduplicate runs by ID (in case a run appears in both queries during transition)
     seen_run_ids = set()
@@ -167,15 +181,12 @@ def get_queued_job_count() -> int:
     in_progress_count = 0
     for run in unique_runs:
         run_id = run.get("id")
+        # Get repo from run (works for both org and repo-level)
+        repo_full_name = run.get("repository", {}).get("full_name", "")
+        if not repo_full_name:
+            continue
 
-        # Get jobs for this run
-        if ORG:
-            repo_full_name = run.get("repository", {}).get("full_name", "")
-            if not repo_full_name:
-                continue
-            jobs_url = f"{GITHUB_API}/repos/{repo_full_name}/actions/runs/{run_id}/jobs?per_page=100"
-        else:
-            jobs_url = f"{GITHUB_API}/repos/{OWNER}/{REPO}/actions/runs/{run_id}/jobs?per_page=100"
+        jobs_url = f"{GITHUB_API}/repos/{repo_full_name}/actions/runs/{run_id}/jobs?per_page=100"
 
         try:
             jobs_resp = requests.get(jobs_url, headers=headers)
@@ -378,24 +389,44 @@ def evaluate_scaling(
 
 
 def get_runners() -> list[dict]:
-    """Get list of all registered runners from GitHub."""
+    """Get list of all registered runners from GitHub.
+
+    For multi-repo mode, queries each repo and merges results.
+    Runners are augmented with 'repo' field for delete operations.
+    """
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github.v3+json",
     }
 
     if ORG:
-        url = f"{GITHUB_API}/orgs/{ORG}/actions/runners?per_page=100"
-    elif OWNER and REPO:
-        url = f"{GITHUB_API}/repos/{OWNER}/{REPO}/actions/runners?per_page=100"
+        urls = [(f"{GITHUB_API}/orgs/{ORG}/actions/runners?per_page=100", None)]
+    elif OWNER and REPO_LIST:
+        urls = [
+            (f"{GITHUB_API}/repos/{OWNER}/{repo}/actions/runners?per_page=100", repo)
+            for repo in REPO_LIST
+        ]
     else:
         return []
 
-    resp = requests.get(url, headers=headers)
-    resp.raise_for_status()
-    data = resp.json()
+    all_runners = []
+    seen_ids = set()  # Deduplicate in case same runner appears in multiple queries
 
-    return data.get("runners", [])
+    for url, repo in urls:
+        try:
+            resp = requests.get(url, headers=headers)
+            resp.raise_for_status()
+            runners = resp.json().get("runners", [])
+            for runner in runners:
+                runner_id = runner.get("id")
+                if runner_id and runner_id not in seen_ids:
+                    seen_ids.add(runner_id)
+                    runner["_repo"] = repo  # Track which repo this runner belongs to
+                    all_runners.append(runner)
+        except requests.RequestException as e:
+            log.warning(f"Failed to get runners from {url}: {e}")
+
+    return all_runners
 
 
 def get_online_runner_count() -> int:
@@ -440,8 +471,13 @@ def get_idle_runner_count() -> int:
     return count
 
 
-def delete_runner(runner_id: int) -> bool:
-    """Delete a runner by ID from GitHub."""
+def delete_runner(runner_id: int, repo: str | None = None) -> bool:
+    """Delete a runner by ID from GitHub.
+
+    Args:
+        runner_id: The GitHub runner ID.
+        repo: For repo-level, the specific repo name. If None, uses ORG or first repo.
+    """
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github.v3+json",
@@ -449,8 +485,11 @@ def delete_runner(runner_id: int) -> bool:
 
     if ORG:
         url = f"{GITHUB_API}/orgs/{ORG}/actions/runners/{runner_id}"
-    elif OWNER and REPO:
-        url = f"{GITHUB_API}/repos/{OWNER}/{REPO}/actions/runners/{runner_id}"
+    elif OWNER and repo:
+        url = f"{GITHUB_API}/repos/{OWNER}/{repo}/actions/runners/{runner_id}"
+    elif OWNER and REPO_LIST:
+        # Fallback to first repo if no specific repo provided
+        url = f"{GITHUB_API}/repos/{OWNER}/{REPO_LIST[0]}/actions/runners/{runner_id}"
     else:
         return False
 
@@ -476,12 +515,13 @@ def cleanup_dead_runners() -> int:
         busy = runner.get("busy", False)
         name = runner.get("name", "unknown")
         runner_id = runner.get("id")
+        repo = runner.get("_repo")  # Repo this runner belongs to (for deletion)
 
         # Only delete offline runners that are not busy
         if status == "offline" and not busy and runner_id:
             log.info(f"Removing dead runner: {name} (ID: {runner_id})")
             try:
-                if delete_runner(runner_id):
+                if delete_runner(runner_id, repo):
                     deleted += 1
                     log.info(f"  Deleted runner {name}")
                 else:
@@ -494,12 +534,16 @@ def cleanup_dead_runners() -> int:
     return deleted
 
 
-AUTOSCALER_VERSION = "2.0.3"  # Log both queued and in_progress job counts
+AUTOSCALER_VERSION = "2.1.0"  # Multi-repo support via REPOS env var
 
 
 def main():
     """Main autoscaler loop (runs continuously)."""
     log.info(f"Starting GitHub Actions Runner Autoscaler v{AUTOSCALER_VERSION} (ephemeral mode)")
+    if ORG:
+        log.info(f"  Target: org/{ORG}")
+    elif REPO_LIST:
+        log.info(f"  Target: {OWNER}/{', '.join(REPO_LIST)}")
     log.info(f"  Worker: {WORKER_NAME}")
     log.info(f"  Min instances: {MIN_INSTANCES}")
     log.info(f"  Max instances: {MAX_INSTANCES}")
