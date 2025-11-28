@@ -472,9 +472,12 @@ def cleanup_dead_runners() -> int:
     return deleted
 
 
+AUTOSCALER_VERSION = "2.0.0"  # Ephemeral runner algorithm
+
+
 def main():
     """Main autoscaler loop (runs continuously)."""
-    log.info("Starting GitHub Actions Runner Autoscaler (ephemeral mode)")
+    log.info(f"Starting GitHub Actions Runner Autoscaler v{AUTOSCALER_VERSION} (ephemeral mode)")
     log.info(f"  Worker: {WORKER_NAME}")
     log.info(f"  Min instances: {MIN_INSTANCES}")
     log.info(f"  Max instances: {MAX_INSTANCES}")
