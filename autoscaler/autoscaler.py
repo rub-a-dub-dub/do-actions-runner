@@ -162,8 +162,9 @@ def get_queued_job_count() -> int:
             seen_run_ids.add(run_id)
             unique_runs.append(run)
 
-    # Count queued jobs across all runs
+    # Count queued and in_progress jobs across all runs
     queued_count = 0
+    in_progress_count = 0
     for run in unique_runs:
         run_id = run.get("id")
 
@@ -182,12 +183,16 @@ def get_queued_job_count() -> int:
             jobs = jobs_resp.json().get("jobs", [])
 
             for job in jobs:
-                if job.get("status") == "queued" and is_self_hosted_job(job):
-                    queued_count += 1
+                if is_self_hosted_job(job):
+                    status = job.get("status")
+                    if status == "queued":
+                        queued_count += 1
+                    elif status == "in_progress":
+                        in_progress_count += 1
         except requests.RequestException as e:
             log.warning(f"Failed to get jobs for run {run_id}: {e}")
 
-    log.info(f"Queued jobs: {queued_count}")
+    log.info(f"Jobs: {queued_count} queued, {in_progress_count} in_progress")
     return queued_count
 
 
@@ -489,7 +494,7 @@ def cleanup_dead_runners() -> int:
     return deleted
 
 
-AUTOSCALER_VERSION = "2.0.1"  # Fix: query in_progress runs for queued jobs
+AUTOSCALER_VERSION = "2.0.3"  # Log both queued and in_progress job counts
 
 
 def main():
