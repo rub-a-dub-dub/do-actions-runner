@@ -107,7 +107,7 @@ This handles runners that crashed without deregistering.
 | `ORG` | for org | Organization name |
 | `WORKER_NAME` | `runner` | Name of worker component to scale |
 | `RUNNER_NAME_PREFIX` | `""` | Prefix to match runner names (empty = count all self-hosted) |
-| `RUNNERS_PER_INSTANCE` | `2` | Number of runner processes per container instance |
+| `RUNNERS_PER_INSTANCE` | `1` | Number of runner processes per container instance |
 | `MIN_INSTANCES` | `1` | Minimum instance count (DO App Platform requires >= 1) |
 | `MAX_INSTANCES` | `5` | Maximum instance count |
 | `POLL_INTERVAL` | `30` | Seconds between polls |

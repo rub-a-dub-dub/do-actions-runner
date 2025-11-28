@@ -53,7 +53,7 @@ SCALE_UP_PROPORTION = float(os.environ.get("SCALE_UP_PROPORTION", "0.5"))  # fra
 RUNNER_NAME_PREFIX = os.environ.get("RUNNER_NAME_PREFIX", "")
 
 # Multiple runners per instance
-RUNNERS_PER_INSTANCE = int(os.environ.get("RUNNERS_PER_INSTANCE", "2"))
+RUNNERS_PER_INSTANCE = int(os.environ.get("RUNNERS_PER_INSTANCE", "1"))
 
 GITHUB_API = "https://api.github.com"
 DO_API = "https://api.digitalocean.com/v2"
